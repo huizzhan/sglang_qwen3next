@@ -2,10 +2,12 @@
 # Adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_interface.py
 # and https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/mamba/ops/causal_conv1d.py
 
-from typing import List, Optional, Union
+from typing import List, Optional, Union, is_typeddict
 
 import torch
 import triton
+from triton.experimental import gluon
+import triton.experimental.gluon.language as gl
 import triton.language as tl
 
 PAD_SLOT_ID = -1
@@ -675,14 +677,14 @@ def _causal_conv1d_update_kernel(
             :, None
         ]
     )  # [BLOCK_M, BLOCK_N]
+    VAL = state_len - seqlen
     mask = (
         (conv_state_batch_coord < num_cache_lines)
-        & ((idx_tokens + seqlen) < state_len)[:, None]
+        & (idx_tokens < VAL)[:, None]
         & (idx_feats < dim)[None, :]
     )
     conv_state = tl.load(conv_state_ptrs_source, mask, other=0.0)
 
-    VAL = state_len - seqlen
     x_base = x_ptr + (idx_seq * stride_x_seq) + (idx_feats * stride_x_dim)  # [BLOCK_N]
 
     x_ptrs = (
@@ -814,6 +816,282 @@ def _causal_conv1d_update_kernel(
             if KERNEL_WIDTH >= 4:
                 tl.store(base_ptr + 2 * stride_inter_win, col2, mask=mask_w)
 
+@gl._core.builtin
+def tuple_combine(a: gl.tuple, b: gl.tensor, _semantic=None) -> gl.tuple:
+    return gl.tuple([*a.values, b])
+
+@gluon.jit()
+def gluon_causal_conv1d_update_kernel(
+    # Pointers to matrices
+    x_ptr,  # (batch, dim, seqlen)
+    w_ptr,  # (dim, width)
+    bias_ptr,
+    conv_state_ptr,
+    cache_seqlens_ptr,  # circular buffer
+    conv_state_indices_ptr,
+    num_accepted_tokens_ptr,
+    intermediate_conv_window_ptr,
+    o_ptr,  # (batch, dim, seqlen)
+    # Matrix dimensions
+    batch: int,
+    dim: gl.constexpr,
+    seqlen: gl.constexpr,
+    state_len: gl.constexpr,
+    num_cache_lines: gl.constexpr,  # added to support vLLM larger cache lines
+    # Strides
+    stride_x_seq: gl.constexpr,
+    stride_x_dim: gl.constexpr,
+    stride_x_token: gl.constexpr,
+    stride_w_dim: gl.constexpr,
+    stride_w_width: gl.constexpr,
+    stride_conv_state_seq: gl.constexpr,
+    stride_conv_state_dim: gl.constexpr,
+    stride_conv_state_tok: gl.constexpr,
+    stride_state_indices: gl.constexpr,
+    stride_inter_seq: gl.constexpr,
+    stride_inter_step: gl.constexpr,
+    stride_inter_dim: gl.constexpr,
+    stride_inter_win: gl.constexpr,
+    stride_o_seq: gl.constexpr,
+    stride_o_dim: gl.constexpr,
+    stride_o_token: gl.constexpr,
+    # others
+    pad_slot_id: gl.constexpr,
+    # Meta-parameters
+    HAS_BIAS: gl.constexpr,
+    KERNEL_WIDTH: gl.constexpr,
+    SILU_ACTIVATION: gl.constexpr,
+    IS_CONTINUOUS_BATCHING: gl.constexpr,
+    IS_SPEC_DECODING: gl.constexpr,
+    NP2_STATELEN: gl.constexpr,
+    USE_PAD_SLOT: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    SAVE_INTERMEDIATE: gl.constexpr,
+):
+
+    blocked: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[2],
+        threads_per_warp=[64],
+        warps_per_cta=[2],
+        order=[0],
+    )
+
+    blocked1: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, 1],
+        threads_per_warp=[4, 16],
+        warps_per_cta=[1, 4],
+        order=[0, 1],
+    )
+    blocked2: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, 1],
+        threads_per_warp=[1, 64],
+        warps_per_cta=[1, 4],
+        order=[1, 0],
+    )
+
+    shared_layout: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=1,
+        per_phase=1,
+        max_phase=1,
+        order=[0]
+    )
+
+    # x_shared = gl.allocate_shared_memory(x_ptr.type.element_ty, [KERNEL_WIDTH - 1 + seqlen, BLOCK_N], shared_layout)  # [conv_state, x]
+
+    update_index: gl.constexpr = KERNEL_WIDTH
+    
+    # ruff: noqa: E501
+    idx_seq = gl.program_id(0)
+    if idx_seq >= batch:
+        return
+
+    # [BLOCK_N,] elements along the feature-dimension (channel)
+    idx_feats = gl.program_id(1) * BLOCK_N + gl.arange(0, BLOCK_N, layout=blocked)
+    # idx_feats1 = gl.program_id(1) * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked1))
+    # idx_feats2 = gl.program_id(1) * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked2))
+
+    if IS_CONTINUOUS_BATCHING:
+        # mask = idx_seq < batch
+        conv_state_batch_coord = gl.load(
+            conv_state_indices_ptr + idx_seq * stride_state_indices
+        ).to(gl.int64)
+    else:
+        conv_state_batch_coord = idx_seq
+    if USE_PAD_SLOT:  # noqa
+        if conv_state_batch_coord == pad_slot_id:
+            # not processing as this is not the actual sequence
+            return
+
+    if IS_SPEC_DECODING:
+        # The rolling of conv state:
+        #
+        # Before forward, the conv_state is:
+        # [history1, history2, ..., historyM].
+        #
+        # After forward, the conv_state becomes:
+        # [history2, ..., historyM, draft1, draft2, ..., draftN].
+        #
+        # After acceptance, it becomes:
+        #
+        # - accept 1 tokens: [history2, ..., historyM, draft1]
+        # - accept 2 tokens: [history3, ..., historyM, draft1, draft2]
+        # - and so on.
+        conv_state_token_offset = gl.load(num_accepted_tokens_ptr + idx_seq) - 1
+    else:
+        conv_state_token_offset = 0
+
+    # STEP 1: READ init_state data
+    conv_states_base = (
+        conv_state_ptr
+        + (conv_state_batch_coord * stride_conv_state_seq)
+        + (idx_feats * stride_conv_state_dim)
+    )
+    mask_w = idx_feats < dim
+
+    prior_tokens = conv_states_base + conv_state_token_offset * stride_conv_state_tok
+    if KERNEL_WIDTH >= 2:
+        conv_states_ptrs = prior_tokens  # [BLOCK_N]
+        col0 = gl.load(conv_states_ptrs, mask_w, 0.0)
+        conv_state_vecs = (col0,)
+    if KERNEL_WIDTH >= 3:
+        conv_states_ptrs = prior_tokens + 1 * stride_conv_state_tok  # [BLOCK_N]
+        col1 = gl.load(conv_states_ptrs, mask_w, 0.0)
+        conv_state_vecs = tuple_combine(conv_state_vecs, col1)
+    if KERNEL_WIDTH >= 4:
+        conv_states_ptrs = prior_tokens + 2 * stride_conv_state_tok  # [BLOCK_N]
+        col2 = gl.load(conv_states_ptrs, mask_w, 0.0)
+        conv_state_vecs = tuple_combine(conv_state_vecs, col2)
+    if KERNEL_WIDTH == 5:
+        conv_states_ptrs = prior_tokens + 3 * stride_conv_state_tok  # [BLOCK_N]
+        col3 = gl.load(conv_states_ptrs, mask_w, 0.0)
+        conv_state_vecs = tuple_combine(conv_state_vecs, col3)
+    # # STEP 2: assume state_len > seqlen
+    # idx_tokens = gl.arange(0, NP2_STATELEN, layout=gl.SliceLayout(1, blocked2))  # [BLOCK_M]
+
+    # # The conv_state updates works in a sliding window manner,
+    # # at each forward pass, the tokens are shift by 1, so we
+    # # load since idx_tokens + 1.
+    # conv_state_ptrs_source = (
+    #     conv_state_ptr
+    #     + (conv_state_batch_coord * stride_conv_state_seq)
+    #     + conv_state_token_offset * stride_conv_state_tok
+    #     + (idx_feats2 * stride_conv_state_dim)[None, :]
+    #     + ((idx_tokens + (1 if IS_SPEC_DECODING else seqlen)) * stride_conv_state_tok)[
+    #         :, None
+    #     ]
+    # )  # [BLOCK_M, BLOCK_N]
+    # VAL = state_len - seqlen
+    # mask = (
+    #     (conv_state_batch_coord < num_cache_lines)
+    #     & (idx_tokens < VAL)[:, None]
+    #     & (idx_feats2 < dim)[None, :]
+    # )
+    # conv_state = gl.load(conv_state_ptrs_source, mask, other=0.0)
+
+
+    # x_base = x_ptr + (idx_seq * stride_x_seq) + (idx_feats2 * stride_x_dim)  # [BLOCK_N]
+
+    # x_ptrs = (
+    #     x_base[None, :] + ((idx_tokens - VAL) * stride_x_token)[:, None]
+    # )  # [BLOCK_M, BLOCK_N]
+
+    # mask_x = (
+    #     (idx_tokens - VAL >= 0)[:, None]
+    #     & (idx_tokens - VAL < seqlen)[:, None]
+    #     & (idx_feats2 < dim)[None, :]
+    # )  # token-index  # token-index  # feature-index
+    # loaded_x = gl.load(x_ptrs, mask_x, 0.0)
+    # tl.debug_barrier()
+
+    # new_conv_state = gl.where(mask, conv_state, loaded_x)
+
+    conv_state_base = (
+        conv_state_ptr
+        + (conv_state_batch_coord * stride_conv_state_seq)
+        + (idx_feats * stride_conv_state_dim)
+    )  # [BLOCK_N,]
+    # conv_state_ptrs_target = (
+    #     conv_state_base + (idx_tokens * stride_conv_state_tok)[:, None]
+    # )  # [BLOCK_M, BLOCK_N]
+    # mask = (idx_tokens < state_len)[:, None] & (idx_feats2 < dim)[None, :]
+    # gl.store(conv_state_ptrs_target, new_conv_state, mask)
+
+    # STEP 3: init accumulator
+    if HAS_BIAS:
+        bias = bias_ptr + idx_feats
+        mask_bias = idx_feats < dim
+        acc_preload = gl.load(bias, mask=mask_bias, other=0.0).to(
+            o_ptr.type.element_ty
+        )  # [BLOCK_N]
+    else:
+        acc_preload = gl.zeros((BLOCK_N,), dtype=o_ptr.type.element_ty, layout=blocked)
+
+    # STEP 4:
+    # PRE-LOAD WEIGHTS
+    # first kernel column, configured for weights to handle BLOCK_N features in range
+    w_base = w_ptr + (idx_feats * stride_w_dim)  # [BLOCK_N,]
+    mask_w = idx_feats < dim
+    if KERNEL_WIDTH >= 2:
+        w_ptrs = w_base + (0 * stride_w_width)  # [BLOCK_N] tensor
+        w_col0 = gl.load(w_ptrs, mask_w, other=0.0)
+        w_ptrs = w_base + (1 * stride_w_width)  # [BLOCK_N] tensor
+        w_col1 = gl.load(w_ptrs, mask_w, other=0.0)
+        w_vecs = (w_col0, w_col1)
+    if KERNEL_WIDTH >= 3:
+        w_ptrs = w_base + (2 * stride_w_width)  # [BLOCK_N] tensor
+        w_col2 = gl.load(w_ptrs, mask_w, other=0.0)
+        w_vecs = tuple_combine(w_vecs, w_col2)
+    if KERNEL_WIDTH >= 4:
+        w_ptrs = w_base + (3 * stride_w_width)  # [BLOCK_N] tensor
+        w_col3 = gl.load(w_ptrs, mask_w, other=0.0)
+        w_vecs = tuple_combine(w_vecs, w_col3)
+
+    x_base_1d = x_ptr + (idx_seq * stride_x_seq) + (idx_feats * stride_x_dim)  # starting of chunk [BLOCK_N]
+    mask_x_1d = idx_feats < dim
+
+    # STEP 5: compute each token
+    for idx_token in gl.static_range(seqlen):
+        acc = acc_preload
+
+        x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
+        x_vec = gl.load(x_ptrs_1d, mask=mask_x_1d)
+        conv_state_vecs = tuple_combine(conv_state_vecs, x_vec)
+        for j in gl.static_range(KERNEL_WIDTH):
+            matrix_w = w_vecs[j]
+            matrix_x = conv_state_vecs[j]
+
+            acc += matrix_x * matrix_w  # [BLOCK_N]
+
+        conv_state_vecs = conv_state_vecs[1:]
+
+        if SILU_ACTIVATION:
+            acc = acc / (1 + gl.exp(-acc))
+        mask_1d = (idx_token < seqlen) & (
+            idx_feats < dim
+        )  # token-index  # feature-index
+        o_ptrs = (
+            o_ptr
+            + (idx_seq) * stride_o_seq
+            + idx_token * stride_o_token
+            + (idx_feats * stride_o_dim)
+        )
+
+        gl.store(o_ptrs, acc, mask=mask_1d)
+
+        if SAVE_INTERMEDIATE:
+            # Save the window state after consuming this token
+            # Layout: [seq(cache line), step, dim, win(K-1)]
+            base_ptr = (
+                intermediate_conv_window_ptr
+                + conv_state_batch_coord * stride_inter_seq
+                + idx_token * stride_inter_step
+                + idx_feats * stride_inter_dim
+            )
+            for l in gl.static_range(state_len):
+                gl.store(base_ptr + l*stride_inter_win, conv_state_vecs[l], idx_feats < dim)
+
+    for l in gl.static_range(state_len):
+        gl.store(conv_state_base + l*stride_conv_state_tok, conv_state_vecs[l], idx_feats < dim)
 
 def causal_conv1d_update(
     x: torch.Tensor,
@@ -921,7 +1199,8 @@ def causal_conv1d_update(
     else:
         stride_inter_seq = stride_inter_step = stride_inter_dim = stride_inter_win = 0
 
-    _causal_conv1d_update_kernel[grid](
+    # _causal_conv1d_update_kernel[grid](
+    gluon_causal_conv1d_update_kernel[grid](
         # Pointers to matrices
         x,
         weight,
@@ -967,6 +1246,7 @@ def causal_conv1d_update(
         USE_PAD_SLOT=pad_slot_id is not None,
         BLOCK_N=256,
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
+        num_warps=2
     )
     if unsqueeze:
         out = out.squeeze(-1)
