@@ -283,7 +283,7 @@ class TestFusedGDNFwdDecode:
         
         print(f"  ✓ Correctness test passed!")
     
-    @pytest.mark.parametrize("batch_size", [64])
+    @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64])
     def test_decode_throughput(self, batch_size, device, dtype):
         """Test decode throughput with various batch sizes."""
         num_heads_qk = 4
@@ -334,7 +334,7 @@ class TestFusedGDNFwdDecode:
         torch.cuda.synchronize()
         
         # Benchmark
-        num_iters = 100
+        num_iters = 1000
         torch.cuda.synchronize()
         start = time.time()
         for _ in range(num_iters):
@@ -372,7 +372,7 @@ class TestFusedGDNFwdDecode:
         
         # Warmup
         for _ in range(3):
-            _ = fused_gdn_fwd_decode( # fused_gdn_fwd_decode_gluon_v2
+            _ = fused_gdn_fwd_decode_gluon_v2( # fused_gdn_fwd_decode_gluon_v2
                 mixed_qkv=mixed_qkv_fused,
                 conv_state=conv_state_fused,
                 conv_weight=inputs["conv_weight"],
@@ -398,7 +398,7 @@ class TestFusedGDNFwdDecode:
         torch.cuda.synchronize()
         start = time.time()
         for _ in range(num_iters):
-            _ = fused_gdn_fwd_decode(  # fused_gdn_fwd_decode_gluon_v2
+            _ = fused_gdn_fwd_decode_gluon_v2(  # fused_gdn_fwd_decode_gluon_v2
                 mixed_qkv=mixed_qkv_fused,
                 conv_state=conv_state_fused,
                 conv_weight=inputs["conv_weight"],
@@ -705,6 +705,383 @@ class TestGluonFusedGDNFwdDecode:
             f"Conv state mismatch: max diff = {(conv_state_gluon - conv_state_triton).abs().max()}"
         
         print(f"✓ Gluon vs Triton test passed")
+    
+    @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64])
+    def test_gluon_vs_reference_throughput(self, batch_size, device, dtype):
+        """Benchmark performance of Gluon kernel vs reference implementation."""
+        num_heads_qk = 4
+        num_heads_v = 8
+        head_dim = 128
+        key_dim = num_heads_qk * head_dim
+        value_dim = num_heads_v * head_dim
+        seqlen = 1
+        conv_width = 4
+        
+        # Create inputs
+        inputs = self.create_test_inputs(
+            batch_size, key_dim, value_dim, num_heads_qk, num_heads_v, head_dim,
+            seqlen, conv_width, device, dtype, has_bias=True
+        )
+        
+        # ====================================================================
+        # Benchmark Reference (Separate Kernels)
+        # ====================================================================
+        
+        # Prepare inputs outside timing loop
+        mixed_qkv_ref = inputs["mixed_qkv"]
+        conv_state_ref = inputs["conv_state"]
+        ssm_state_ref = inputs["ssm_state"]
+        
+        # Warmup
+        for _ in range(3):
+            _ = gdn_fwd_decode_ref(
+                mixed_qkv=mixed_qkv_ref,
+                conv_state=conv_state_ref,
+                conv_weight=inputs["conv_weight"],
+                A_log=inputs["A_log"],
+                a=inputs["a"],
+                dt_bias=inputs["dt_bias"],
+                b=inputs["b"],
+                ssm_state=ssm_state_ref,
+                key_dim=key_dim,
+                value_dim=value_dim,
+                num_heads_qk=num_heads_qk,
+                num_heads_v=num_heads_v,
+                head_dim=head_dim,
+                conv_bias=inputs["conv_bias"],
+                activation="silu",
+                conv_state_indices=inputs["conv_state_indices"],
+                ssm_state_indices=inputs["ssm_state_indices"],
+                use_qk_l2norm_in_kernel=True,
+            )
+        torch.cuda.synchronize()
+        
+        # Benchmark
+        num_iters = 1000
+        torch.cuda.synchronize()
+        start = time.time()
+        for _ in range(num_iters):
+            _ = gdn_fwd_decode_ref(
+                mixed_qkv=mixed_qkv_ref,
+                conv_state=conv_state_ref,
+                conv_weight=inputs["conv_weight"],
+                A_log=inputs["A_log"],
+                a=inputs["a"],
+                dt_bias=inputs["dt_bias"],
+                b=inputs["b"],
+                ssm_state=ssm_state_ref,
+                key_dim=key_dim,
+                value_dim=value_dim,
+                num_heads_qk=num_heads_qk,
+                num_heads_v=num_heads_v,
+                head_dim=head_dim,
+                conv_bias=inputs["conv_bias"],
+                activation="silu",
+                conv_state_indices=inputs["conv_state_indices"],
+                ssm_state_indices=inputs["ssm_state_indices"],
+                use_qk_l2norm_in_kernel=True,
+            )
+        torch.cuda.synchronize()
+        ref_time = (time.time() - start) / num_iters * 1000  # ms
+        
+        # ====================================================================
+        # Benchmark Gluon Kernel
+        # ====================================================================
+        
+        # Prepare inputs outside timing loop
+        mixed_qkv_gluon = inputs["mixed_qkv"]
+        conv_state_gluon = inputs["conv_state"]
+        ssm_state_gluon = inputs["ssm_state"]
+        
+        # Warmup
+        for _ in range(3):
+            _ = fused_gdn_fwd_decode_gluon(
+                mixed_qkv=mixed_qkv_gluon,
+                conv_state=conv_state_gluon,
+                conv_weight=inputs["conv_weight"],
+                A_log=inputs["A_log"],
+                a=inputs["a"],
+                dt_bias=inputs["dt_bias"],
+                b=inputs["b"],
+                ssm_state=ssm_state_gluon,
+                key_dim=key_dim,
+                value_dim=value_dim,
+                num_heads_qk=num_heads_qk,
+                num_heads_v=num_heads_v,
+                head_dim=head_dim,
+                conv_bias=inputs["conv_bias"],
+                activation="silu",
+                conv_state_indices=inputs["conv_state_indices"],
+                ssm_state_indices=inputs["ssm_state_indices"],
+                use_qk_l2norm_in_kernel=True,
+            )
+        torch.cuda.synchronize()
+        
+        # Benchmark
+        torch.cuda.synchronize()
+        start = time.time()
+        for _ in range(num_iters):
+            _ = fused_gdn_fwd_decode_gluon(
+                mixed_qkv=mixed_qkv_gluon,
+                conv_state=conv_state_gluon,
+                conv_weight=inputs["conv_weight"],
+                A_log=inputs["A_log"],
+                a=inputs["a"],
+                dt_bias=inputs["dt_bias"],
+                b=inputs["b"],
+                ssm_state=ssm_state_gluon,
+                key_dim=key_dim,
+                value_dim=value_dim,
+                num_heads_qk=num_heads_qk,
+                num_heads_v=num_heads_v,
+                head_dim=head_dim,
+                conv_bias=inputs["conv_bias"],
+                activation="silu",
+                conv_state_indices=inputs["conv_state_indices"],
+                ssm_state_indices=inputs["ssm_state_indices"],
+                use_qk_l2norm_in_kernel=True,
+            )
+        torch.cuda.synchronize()
+        gluon_time = (time.time() - start) / num_iters * 1000  # ms
+        
+        # Calculate metrics
+        speedup = ref_time / gluon_time
+        throughput_ref = (num_iters * batch_size) / (ref_time * num_iters / 1000)
+        throughput_gluon = (num_iters * batch_size) / (gluon_time * num_iters / 1000)
+        print()
+        
+        print(f"    - Reference time per iteration: {ref_time=:.4f} ms")
+        print(f"    - Gluon time per iteration:     {gluon_time=:.4f} ms")
+        
+        if speedup > 1.05:
+            print(f"    - Status: ✓ Gluon kernel is {speedup:.2f}x FASTER")
+        elif speedup < 0.95:
+            print(f"    - Status: ⚠ Reference is {1/speedup:.2f}x FASTER")
+        else:
+            print(f"    - Status: ≈ Performance is similar")
+        
+        print(f"{'='*70}")
+    
+    @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64])
+    def test_three_way_performance_comparison(self, batch_size, device, dtype):
+        """
+        Benchmark performance comparison of three implementations:
+        1. gdn_fwd_decode_ref (Python reference)
+        2. fused_gdn_fwd_decode_gluon (Gluon v1, Q/K-indexed)
+        3. fused_gdn_fwd_decode_gluon_v2 (Gluon v2, V-indexed)
+        """
+        num_heads_qk = 4
+        num_heads_v = 8
+        head_dim = 128
+        key_dim = num_heads_qk * head_dim
+        value_dim = num_heads_v * head_dim
+        seqlen = 1
+        conv_width = 4
+        
+        # Create inputs
+        inputs = self.create_test_inputs(
+            batch_size, key_dim, value_dim, num_heads_qk, num_heads_v, head_dim,
+            seqlen, conv_width, device, dtype, has_bias=True
+        )
+        
+        # Prepare inputs outside timing loop (shared across all implementations)
+        mixed_qkv = inputs["mixed_qkv"]
+        conv_state = inputs["conv_state"]
+        ssm_state = inputs["ssm_state"]
+        
+        num_iters = 1000
+        
+        # ====================================================================
+        # Benchmark 1: Reference Implementation (Python)
+        # ====================================================================
+        
+        # Warmup
+        for _ in range(3):
+            _ = gdn_fwd_decode_ref(
+                mixed_qkv=mixed_qkv,
+                conv_state=conv_state,
+                conv_weight=inputs["conv_weight"],
+                A_log=inputs["A_log"],
+                a=inputs["a"],
+                dt_bias=inputs["dt_bias"],
+                b=inputs["b"],
+                ssm_state=ssm_state,
+                key_dim=key_dim,
+                value_dim=value_dim,
+                num_heads_qk=num_heads_qk,
+                num_heads_v=num_heads_v,
+                head_dim=head_dim,
+                conv_bias=inputs["conv_bias"],
+                activation="silu",
+                conv_state_indices=inputs["conv_state_indices"],
+                ssm_state_indices=inputs["ssm_state_indices"],
+                use_qk_l2norm_in_kernel=True,
+            )
+        torch.cuda.synchronize()
+        
+        # Benchmark
+        torch.cuda.synchronize()
+        start = time.time()
+        for _ in range(num_iters):
+            _ = gdn_fwd_decode_ref(
+                mixed_qkv=mixed_qkv,
+                conv_state=conv_state,
+                conv_weight=inputs["conv_weight"],
+                A_log=inputs["A_log"],
+                a=inputs["a"],
+                dt_bias=inputs["dt_bias"],
+                b=inputs["b"],
+                ssm_state=ssm_state,
+                key_dim=key_dim,
+                value_dim=value_dim,
+                num_heads_qk=num_heads_qk,
+                num_heads_v=num_heads_v,
+                head_dim=head_dim,
+                conv_bias=inputs["conv_bias"],
+                activation="silu",
+                conv_state_indices=inputs["conv_state_indices"],
+                ssm_state_indices=inputs["ssm_state_indices"],
+                use_qk_l2norm_in_kernel=True,
+            )
+        torch.cuda.synchronize()
+        ref_time = (time.time() - start) / num_iters * 1000  # ms
+        
+        # ====================================================================
+        # Benchmark 2: Gluon v1 (Q/K-indexed)
+        # ====================================================================
+        
+        # Warmup
+        for _ in range(3):
+            _ = fused_gdn_fwd_decode_gluon(
+                mixed_qkv=mixed_qkv,
+                conv_state=conv_state,
+                conv_weight=inputs["conv_weight"],
+                A_log=inputs["A_log"],
+                a=inputs["a"],
+                dt_bias=inputs["dt_bias"],
+                b=inputs["b"],
+                ssm_state=ssm_state,
+                key_dim=key_dim,
+                value_dim=value_dim,
+                num_heads_qk=num_heads_qk,
+                num_heads_v=num_heads_v,
+                head_dim=head_dim,
+                conv_bias=inputs["conv_bias"],
+                activation="silu",
+                conv_state_indices=inputs["conv_state_indices"],
+                ssm_state_indices=inputs["ssm_state_indices"],
+                use_qk_l2norm_in_kernel=True,
+            )
+        torch.cuda.synchronize()
+        
+        # Benchmark
+        torch.cuda.synchronize()
+        start = time.time()
+        for _ in range(num_iters):
+            _ = fused_gdn_fwd_decode_gluon(
+                mixed_qkv=mixed_qkv,
+                conv_state=conv_state,
+                conv_weight=inputs["conv_weight"],
+                A_log=inputs["A_log"],
+                a=inputs["a"],
+                dt_bias=inputs["dt_bias"],
+                b=inputs["b"],
+                ssm_state=ssm_state,
+                key_dim=key_dim,
+                value_dim=value_dim,
+                num_heads_qk=num_heads_qk,
+                num_heads_v=num_heads_v,
+                head_dim=head_dim,
+                conv_bias=inputs["conv_bias"],
+                activation="silu",
+                conv_state_indices=inputs["conv_state_indices"],
+                ssm_state_indices=inputs["ssm_state_indices"],
+                use_qk_l2norm_in_kernel=True,
+            )
+        torch.cuda.synchronize()
+        gluon_v1_time = (time.time() - start) / num_iters * 1000  # ms
+        
+        # ====================================================================
+        # Benchmark 3: Gluon v2 (V-indexed)
+        # ====================================================================
+        
+        # Warmup
+        for _ in range(3):
+            _ = fused_gdn_fwd_decode_gluon_v2(
+                mixed_qkv=mixed_qkv,
+                conv_state=conv_state,
+                conv_weight=inputs["conv_weight"],
+                A_log=inputs["A_log"],
+                a=inputs["a"],
+                dt_bias=inputs["dt_bias"],
+                b=inputs["b"],
+                ssm_state=ssm_state,
+                key_dim=key_dim,
+                value_dim=value_dim,
+                num_heads_qk=num_heads_qk,
+                num_heads_v=num_heads_v,
+                head_dim=head_dim,
+                conv_bias=inputs["conv_bias"],
+                activation="silu",
+                conv_state_indices=inputs["conv_state_indices"],
+                ssm_state_indices=inputs["ssm_state_indices"],
+                use_qk_l2norm_in_kernel=True,
+            )
+        torch.cuda.synchronize()
+        
+        # Benchmark
+        torch.cuda.synchronize()
+        start = time.time()
+        for _ in range(num_iters):
+            _ = fused_gdn_fwd_decode_gluon_v2(
+                mixed_qkv=mixed_qkv,
+                conv_state=conv_state,
+                conv_weight=inputs["conv_weight"],
+                A_log=inputs["A_log"],
+                a=inputs["a"],
+                dt_bias=inputs["dt_bias"],
+                b=inputs["b"],
+                ssm_state=ssm_state,
+                key_dim=key_dim,
+                value_dim=value_dim,
+                num_heads_qk=num_heads_qk,
+                num_heads_v=num_heads_v,
+                head_dim=head_dim,
+                conv_bias=inputs["conv_bias"],
+                activation="silu",
+                conv_state_indices=inputs["conv_state_indices"],
+                ssm_state_indices=inputs["ssm_state_indices"],
+                use_qk_l2norm_in_kernel=True,
+            )
+        torch.cuda.synchronize()
+        gluon_v2_time = (time.time() - start) / num_iters * 1000  # ms
+        
+        # ====================================================================
+        # Calculate and Display Results
+        # ====================================================================
+        
+        speedup_v1_vs_ref = ref_time / gluon_v1_time
+        speedup_v2_vs_ref = ref_time / gluon_v2_time
+        speedup_v2_vs_v1 = gluon_v1_time / gluon_v2_time
+        
+        print()
+        print(f"{'='*70}")
+        print(f"Three-Way Performance Comparison (batch_size={batch_size})")
+        print(f"{'='*70}")
+        print(f"  Reference (Python):     {ref_time:.4f} ms")
+        print(f"  Gluon v1 (Q/K-indexed): {gluon_v1_time:.4f} ms  (vs ref: {speedup_v1_vs_ref:.2f}x)")
+        print(f"  Gluon v2 (V-indexed):   {gluon_v2_time:.4f} ms  (vs ref: {speedup_v2_vs_ref:.2f}x, vs v1: {speedup_v2_vs_v1:.2f}x)")
+        print(f"{'='*70}")
+        
+        # Determine the fastest
+        times = {
+            "Reference": ref_time,
+            "Gluon v1": gluon_v1_time,
+            "Gluon v2": gluon_v2_time,
+        }
+        fastest = min(times, key=times.get)
+        print(f"  ✓ Fastest: {fastest} ({times[fastest]:.4f} ms)")
+        print(f"{'='*70}")
 
 
 class TestKernelComparison:
@@ -1215,8 +1592,8 @@ class TestGluonFusedGDNFwdDecodeV2:
         
         print(f"✓ Gluon v1 vs v2 test passed (batch={batch_size}, seqlen={seqlen})")
     
-    @pytest.mark.parametrize("batch", [1, 4, 8])
-    @pytest.mark.parametrize("seqlen", [1, 16, 64])
+    @pytest.mark.parametrize("batch", [1, 2, 4, 8, 16, 32, 64])
+    @pytest.mark.parametrize("seqlen", [1])
     @pytest.mark.parametrize("head_dim", [128])
     @pytest.mark.parametrize("num_heads_v", [8])
     @pytest.mark.parametrize("num_heads_qk", [4])
