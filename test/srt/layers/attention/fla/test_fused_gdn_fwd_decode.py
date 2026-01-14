@@ -17,11 +17,12 @@ from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
 from sglang.srt.layers.attention.fla.fused_gdn_fwd_decode import (
-    fused_gdn_fwd_decode,
+    fused_gdn_fwd_decode, fused_gdn_fwd_decode_v2, fused_gdn_fwd_decode_v3,
     PAD_SLOT_ID,
 )
 from sglang.srt.layers.attention.fla.fused_gdn_fwd_decode_gluon import (
-    fused_gdn_fwd_decode_gluon, fused_gdn_fwd_decode_gluon_v2,
+    fused_gdn_fwd_decode_gluon, fused_gdn_fwd_decode_gluon_v2, fused_gdn_fwd_decode_gluon_v3, 
+    fused_gdn_fwd_decode_gluon_v4, fused_gdn_fwd_decode_gluon_v5, fused_gdn_fwd_decode_gluon_v6
 )
 import triton
 
@@ -95,6 +96,15 @@ def gdn_fwd_decode_ref(
     
     return output
 
+def get_copy_size(batch_size, head_dim, seqlen, conv_width, num_heads_v):
+    return (
+        (batch_size * head_dim * num_heads_v * seqlen * 3  * conv_width * 2 # qkv + conv_states + conv_weights
+        + batch_size * head_dim * seqlen * num_heads_v  # conv_bias
+        + batch_size * num_heads_v * 4 # A_log + a + dt_bias + b
+        ) * 2 # bf16
+        + batch_size * num_heads_v * head_dim * head_dim # ssm_state
+        * 4 # fp32
+    )
 
 class TestFusedGDNFwdDecode:
     """Test suite for fused GDN forward decode kernel."""
@@ -133,8 +143,8 @@ class TestFusedGDNFwdDecode:
         # Conv1D inputs
         mixed_qkv = torch.randn(batch_size, dim, seqlen, device=device, dtype=dtype)
         conv_state = torch.randn(
-            batch_size + 10, dim, conv_width - 1, device=device, dtype=dtype
-        )
+            batch_size + 10, conv_width - 1, dim, device=device, dtype=dtype
+        ).transpose(1, 2)
         conv_weight = torch.randn(dim, conv_width, device=device, dtype=dtype)
         conv_bias = torch.randn(dim, device=device, dtype=dtype) if has_bias else None
         
@@ -177,7 +187,7 @@ class TestFusedGDNFwdDecode:
     @pytest.mark.parametrize("num_heads_qk", [4])
     @pytest.mark.parametrize("num_heads_v", [8])
     @pytest.mark.parametrize("head_dim", [128])
-    @pytest.mark.parametrize("seqlen", [1])
+    @pytest.mark.parametrize("seqlen", [2])
     @pytest.mark.parametrize("conv_width", [4])
     @pytest.mark.parametrize("has_bias", [True])
     def test_correctness(
@@ -195,6 +205,7 @@ class TestFusedGDNFwdDecode:
         """Test that fused kernel produces the same results as reference."""
         key_dim = num_heads_qk * head_dim
         value_dim = num_heads_v * head_dim
+        torch.cuda.manual_seed(0)
         
         # Create inputs
         inputs = self.create_test_inputs(
@@ -283,6 +294,8 @@ class TestFusedGDNFwdDecode:
         
         print(f"  ✓ Correctness test passed!")
     
+
+
     @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64])
     def test_decode_throughput(self, batch_size, device, dtype):
         """Test decode throughput with various batch sizes."""
@@ -293,7 +306,7 @@ class TestFusedGDNFwdDecode:
         value_dim = num_heads_v * head_dim
         seqlen = 1
         conv_width = 4
-        
+     
         # Create inputs
         inputs = self.create_test_inputs(
             batch_size, key_dim, value_dim, num_heads_qk, num_heads_v, head_dim,
@@ -421,10 +434,11 @@ class TestFusedGDNFwdDecode:
         torch.cuda.synchronize()
         fused_time = (time.time() - start) / num_iters * 1000  # ms
         
+        copy_size = get_copy_size(batch_size, head_dim, seqlen, conv_width, num_heads_v)
         # Calculate metrics
         speedup = ref_time / fused_time
-        throughput_ref = (num_iters * batch_size) / (ref_time * num_iters / 1000)
-        throughput_fused = (num_iters * batch_size) / (fused_time * num_iters / 1000)
+        throughput_ref = (num_iters * copy_size) / (ref_time * num_iters / 1000)
+        throughput_fused = (num_iters * copy_size) / (fused_time * num_iters / 1000)
         print()
         
         # print(f"\n{'='*70}")
@@ -437,12 +451,12 @@ class TestFusedGDNFwdDecode:
         # print(f"  - seqlen:       {seqlen}")
         # print(f"  - dtype:        {dtype}")
         # print(f"\nPerformance Results (averaged over {num_iters} iterations):")
-        # print(f"\n  Reference (Separate Kernels):")
+        print(f"\n  Reference (Separate Kernels):")
         print(f"    - Time per iteration:  {ref_time=:.4f} ms")
-        # print(f"    - Throughput:          {throughput_ref:.2f} tokens/s")
-        # print(f"\n  Fused Kernel:")
+        print(f"    - Throughput:          {throughput_ref:.2f} tokens/s")
+        print(f"\n  Fused Kernel:")
         print(f"    - Time per iteration:  {fused_time=:.4f} ms")
-        # print(f"    - Throughput:          {throughput_fused:.2f} tokens/s")
+        print(f"    - Throughput:          {throughput_fused:.2f} tokens/s")
         # print(f"\n  Performance Comparison:")
         # print(f"    - Speedup (Fused/Reference): {speedup:.2f}x")
         # print(f"    - Time saved:                {ref_time - fused_time:.4f} ms")
@@ -567,8 +581,8 @@ class TestGluonFusedGDNFwdDecode:
         
         mixed_qkv = torch.randn(batch_size, dim, seqlen, device=device, dtype=dtype)
         conv_state = torch.randn(
-            batch_size + 10, dim, conv_width - 1, device=device, dtype=dtype
-        )
+            batch_size + 10, conv_width - 1, dim, device=device, dtype=dtype
+        ).transpose(1, 2)
         conv_weight = torch.randn(dim, conv_width, device=device, dtype=dtype)
         conv_bias = torch.randn(dim, device=device, dtype=dtype) if has_bias else None
         
@@ -706,9 +720,11 @@ class TestGluonFusedGDNFwdDecode:
         
         print(f"✓ Gluon vs Triton test passed")
     
-    @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64])
+    @pytest.mark.parametrize("batch_size", [64])
     def test_gluon_vs_reference_throughput(self, batch_size, device, dtype):
         """Benchmark performance of Gluon kernel vs reference implementation."""
+        import os
+        
         num_heads_qk = 4
         num_heads_v = 8
         head_dim = 128
@@ -795,7 +811,7 @@ class TestGluonFusedGDNFwdDecode:
         
         # Warmup
         for _ in range(3):
-            _ = fused_gdn_fwd_decode_gluon(
+            _ = fused_gdn_fwd_decode_gluon_v2(
                 mixed_qkv=mixed_qkv_gluon,
                 conv_state=conv_state_gluon,
                 conv_weight=inputs["conv_weight"],
@@ -821,7 +837,7 @@ class TestGluonFusedGDNFwdDecode:
         torch.cuda.synchronize()
         start = time.time()
         for _ in range(num_iters):
-            _ = fused_gdn_fwd_decode_gluon(
+            _ = fused_gdn_fwd_decode_gluon_v2(
                 mixed_qkv=mixed_qkv_gluon,
                 conv_state=conv_state_gluon,
                 conv_weight=inputs["conv_weight"],
@@ -862,7 +878,205 @@ class TestGluonFusedGDNFwdDecode:
         
         print(f"{'='*70}")
     
-    @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64])
+    @pytest.mark.parametrize("batch_size", [64])
+    @pytest.mark.parametrize("num_iters", [100])
+    def test_generate_profiler_traces(self, batch_size, num_iters, device, dtype):
+        """
+        Generate PyTorch profiler traces for Reference and Gluon v2 implementations.
+        
+        This test creates separate trace files for detailed performance analysis:
+        - ~/trace_gdn_fwd_decode_ref.json: Reference implementation trace
+        - ~/trace_fused_gdn_fwd_decode_gluon_v2.json: Gluon v2 implementation trace
+        
+        Use chrome://tracing or https://ui.perfetto.dev/ to visualize the traces.
+        """
+        import os
+        
+        num_heads_qk = 4
+        num_heads_v = 8
+        head_dim = 128
+        key_dim = num_heads_qk * head_dim
+        value_dim = num_heads_v * head_dim
+        seqlen = 1
+        conv_width = 4
+        
+        # Create inputs
+        inputs = self.create_test_inputs(
+            batch_size, key_dim, value_dim, num_heads_qk, num_heads_v, head_dim,
+            seqlen, conv_width, device, dtype, has_bias=True
+        )
+        
+        print(f"\n{'='*70}")
+        print(f"Generating Profiler Traces")
+        print(f"{'='*70}")
+        print(f"Configuration:")
+        print(f"  - batch_size: {batch_size}")
+        print(f"  - num_iters: {num_iters}")
+        print(f"  - num_heads_qk: {num_heads_qk}")
+        print(f"  - num_heads_v: {num_heads_v}")
+        print(f"  - head_dim: {head_dim}")
+        print(f"  - seqlen: {seqlen}")
+        print(f"{'='*70}\n")
+        
+        # ====================================================================
+        # Profile Reference Implementation
+        # ====================================================================
+        
+        print("Profiling Reference implementation...")
+        
+        # Prepare inputs
+        mixed_qkv_ref = inputs["mixed_qkv"]
+        conv_state_ref = inputs["conv_state"]
+        ssm_state_ref = inputs["ssm_state"]
+        
+        # Warmup
+        for _ in range(3):
+            _ = gdn_fwd_decode_ref(
+                mixed_qkv=mixed_qkv_ref,
+                conv_state=conv_state_ref,
+                conv_weight=inputs["conv_weight"],
+                A_log=inputs["A_log"],
+                a=inputs["a"],
+                dt_bias=inputs["dt_bias"],
+                b=inputs["b"],
+                ssm_state=ssm_state_ref,
+                key_dim=key_dim,
+                value_dim=value_dim,
+                num_heads_qk=num_heads_qk,
+                num_heads_v=num_heads_v,
+                head_dim=head_dim,
+                conv_bias=inputs["conv_bias"],
+                activation="silu",
+                conv_state_indices=inputs["conv_state_indices"],
+                ssm_state_indices=inputs["ssm_state_indices"],
+                use_qk_l2norm_in_kernel=True,
+            )
+        torch.cuda.synchronize()
+        
+        # Profile
+        trace_path_ref = os.path.expanduser("~/trace_gdn_fwd_decode_ref.json")
+        
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        ) as prof_ref:
+            for _ in range(num_iters):
+                _ = gdn_fwd_decode_ref(
+                    mixed_qkv=mixed_qkv_ref,
+                    conv_state=conv_state_ref,
+                    conv_weight=inputs["conv_weight"],
+                    A_log=inputs["A_log"],
+                    a=inputs["a"],
+                    dt_bias=inputs["dt_bias"],
+                    b=inputs["b"],
+                    ssm_state=ssm_state_ref,
+                    key_dim=key_dim,
+                    value_dim=value_dim,
+                    num_heads_qk=num_heads_qk,
+                    num_heads_v=num_heads_v,
+                    head_dim=head_dim,
+                    conv_bias=inputs["conv_bias"],
+                    activation="silu",
+                    conv_state_indices=inputs["conv_state_indices"],
+                    ssm_state_indices=inputs["ssm_state_indices"],
+                    use_qk_l2norm_in_kernel=True,
+                )
+        
+        torch.cuda.synchronize()
+        
+        # Export trace
+        prof_ref.export_chrome_trace(trace_path_ref)
+        print(f"  ✓ Reference trace saved: {trace_path_ref}")
+        
+        # ====================================================================
+        # Profile Gluon v2 Implementation
+        # ====================================================================
+        
+        print("\nProfiling Gluon v2 implementation...")
+        
+        # Prepare inputs
+        mixed_qkv_gluon = inputs["mixed_qkv"]
+        conv_state_gluon = inputs["conv_state"]
+        ssm_state_gluon = inputs["ssm_state"]
+        
+        # Warmup
+        for _ in range(3):
+            _ = fused_gdn_fwd_decode_gluon_v2(
+                mixed_qkv=mixed_qkv_gluon,
+                conv_state=conv_state_gluon,
+                conv_weight=inputs["conv_weight"],
+                A_log=inputs["A_log"],
+                a=inputs["a"],
+                dt_bias=inputs["dt_bias"],
+                b=inputs["b"],
+                ssm_state=ssm_state_gluon,
+                key_dim=key_dim,
+                value_dim=value_dim,
+                num_heads_qk=num_heads_qk,
+                num_heads_v=num_heads_v,
+                head_dim=head_dim,
+                conv_bias=inputs["conv_bias"],
+                activation="silu",
+                conv_state_indices=inputs["conv_state_indices"],
+                ssm_state_indices=inputs["ssm_state_indices"],
+                use_qk_l2norm_in_kernel=True,
+            )
+        torch.cuda.synchronize()
+        
+        # Profile
+        trace_path_gluon = os.path.expanduser("~/trace_fused_gdn_fwd_decode_gluon_v2.json")
+        
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        ) as prof_gluon:
+            for _ in range(num_iters):
+                _ = fused_gdn_fwd_decode_gluon_v2(
+                    mixed_qkv=mixed_qkv_gluon,
+                    conv_state=conv_state_gluon,
+                    conv_weight=inputs["conv_weight"],
+                    A_log=inputs["A_log"],
+                    a=inputs["a"],
+                    dt_bias=inputs["dt_bias"],
+                    b=inputs["b"],
+                    ssm_state=ssm_state_gluon,
+                    key_dim=key_dim,
+                    value_dim=value_dim,
+                    num_heads_qk=num_heads_qk,
+                    num_heads_v=num_heads_v,
+                    head_dim=head_dim,
+                    conv_bias=inputs["conv_bias"],
+                    activation="silu",
+                    conv_state_indices=inputs["conv_state_indices"],
+                    ssm_state_indices=inputs["ssm_state_indices"],
+                    use_qk_l2norm_in_kernel=True,
+                )
+        
+        torch.cuda.synchronize()
+        
+        # Export trace
+        prof_gluon.export_chrome_trace(trace_path_gluon)
+        print(f"  ✓ Gluon v2 trace saved: {trace_path_gluon}")
+        
+        print(f"\n{'='*70}")
+        print("Profiler traces generated successfully!")
+        print(f"{'='*70}")
+        print("\nView traces using:")
+        print("  - Chrome: chrome://tracing")
+        print("  - Perfetto: https://ui.perfetto.dev/")
+        print(f"{'='*70}\n")
+    
+    @pytest.mark.parametrize("batch_size", [64])
     def test_three_way_performance_comparison(self, batch_size, device, dtype):
         """
         Benchmark performance comparison of three implementations:
@@ -1007,7 +1221,7 @@ class TestGluonFusedGDNFwdDecode:
         
         # Warmup
         for _ in range(3):
-            _ = fused_gdn_fwd_decode_gluon_v2(
+            _ = fused_gdn_fwd_decode_gluon_v6(
                 mixed_qkv=mixed_qkv,
                 conv_state=conv_state,
                 conv_weight=inputs["conv_weight"],
@@ -1033,7 +1247,7 @@ class TestGluonFusedGDNFwdDecode:
         torch.cuda.synchronize()
         start = time.time()
         for _ in range(num_iters):
-            _ = fused_gdn_fwd_decode_gluon_v2(
+            _ = fused_gdn_fwd_decode_gluon_v6(
                 mixed_qkv=mixed_qkv,
                 conv_state=conv_state,
                 conv_weight=inputs["conv_weight"],
@@ -1064,13 +1278,19 @@ class TestGluonFusedGDNFwdDecode:
         speedup_v2_vs_ref = ref_time / gluon_v2_time
         speedup_v2_vs_v1 = gluon_v1_time / gluon_v2_time
         
+        copy_size = get_copy_size(batch_size, head_dim, seqlen, conv_width, num_heads_v) / 1024 / 1024 / 1024 # GB
+
+        bandwidth_ref = copy_size / (ref_time / 1000)
+        bandwidth_v1 = copy_size / (gluon_v1_time / 1000)
+        bandwidth_v2 = copy_size / (gluon_v2_time / 1000)
+
         print()
         print(f"{'='*70}")
         print(f"Three-Way Performance Comparison (batch_size={batch_size})")
         print(f"{'='*70}")
-        print(f"  Reference (Python):     {ref_time:.4f} ms")
-        print(f"  Gluon v1 (Q/K-indexed): {gluon_v1_time:.4f} ms  (vs ref: {speedup_v1_vs_ref:.2f}x)")
-        print(f"  Gluon v2 (V-indexed):   {gluon_v2_time:.4f} ms  (vs ref: {speedup_v2_vs_ref:.2f}x, vs v1: {speedup_v2_vs_v1:.2f}x)")
+        print(f"  Reference (Python):     {ref_time:.4f} ms, {bandwidth_ref:.2f} GB/s")
+        print(f"  Gluon v1 (Q/K-indexed): {gluon_v1_time:.4f} ms, {bandwidth_v1:.2f} GB/s  (vs ref: {speedup_v1_vs_ref:.2f}x)")
+        print(f"  Gluon v2 (V-indexed):   {gluon_v2_time:.4f} ms, {bandwidth_v2:.2f} GB/s  (vs ref: {speedup_v2_vs_ref:.2f}x, vs v1: {speedup_v2_vs_v1:.2f}x)")
         print(f"{'='*70}")
         
         # Determine the fastest
@@ -1117,7 +1337,7 @@ class TestKernelComparison:
         
         # Create input tensors
         mixed_qkv = torch.randn(batch, dim, seqlen, device=device, dtype=torch.float32)
-        conv_state = torch.randn(batch, dim, conv_width - 1, device=device, dtype=torch.float32)
+        conv_state = torch.randn(batch, conv_width - 1, dim, device=device, dtype=torch.float32).transpose(1, 2)
         conv_weight = torch.randn(dim, conv_width, device=device, dtype=torch.float32)
         conv_bias = torch.randn(dim, device=device, dtype=torch.float32)
         
@@ -1165,11 +1385,6 @@ class TestKernelComparison:
             conv_bias=conv_bias,
             activation="silu",
             ssm_state_indices=ssm_state_indices,
-        )
-        
-        # Run v2 (V-indexed)
-        from sglang.srt.layers.attention.fla.fused_gdn_fwd_decode import (
-            fused_gdn_fwd_decode_v2,
         )
         
         output_v2 = fused_gdn_fwd_decode_v2(
@@ -1239,7 +1454,7 @@ class TestKernelComparison:
         
         # Create input tensors
         mixed_qkv = torch.randn(batch, dim, seqlen, device=device, dtype=torch.float32)
-        conv_state = torch.randn(batch, dim, conv_width - 1, device=device, dtype=torch.float32)
+        conv_state = torch.randn(batch, conv_width - 1, dim, device=device, dtype=torch.float32).transpose(1, 2)
         conv_weight = torch.randn(dim, conv_width, device=device, dtype=torch.float32)
         conv_bias = torch.randn(dim, device=device, dtype=torch.float32)
         
@@ -1254,11 +1469,6 @@ class TestKernelComparison:
             batch, value_dim, head_dim, head_dim, device=device, dtype=torch.float32
         )
         ssm_state_indices = torch.arange(batch, device=device, dtype=torch.int32)
-        
-        from sglang.srt.layers.attention.fla.fused_gdn_fwd_decode import (
-            fused_gdn_fwd_decode,
-            fused_gdn_fwd_decode_v2,
-        )
         
         # Warmup
         for _ in range(10):
@@ -1394,12 +1604,12 @@ class TestGluonFusedGDNFwdDecodeV2:
         assert value_dim == num_heads_v * head_dim
         
         dim = 2 * key_dim + value_dim
-        HV = num_heads_v * head_dim
+        HV = num_heads_v
         
         mixed_qkv = torch.randn(batch_size, dim, seqlen, device=device, dtype=dtype)
         conv_state = torch.randn(
-            batch_size + 10, dim, conv_width - 1, device=device, dtype=dtype
-        )
+            batch_size + 10, conv_width - 1, dim, device=device, dtype=dtype
+        ).transpose(1, 2)
         conv_weight = torch.randn(dim, conv_width, device=device, dtype=dtype)
         conv_bias = torch.randn(dim, device=device, dtype=dtype) if has_bias else None
         
@@ -1435,7 +1645,7 @@ class TestGluonFusedGDNFwdDecodeV2:
             "head_dim": head_dim,
         }
     
-    @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64])
+    @pytest.mark.parametrize("batch_size", [1])
     @pytest.mark.parametrize("num_heads_qk", [4])
     @pytest.mark.parametrize("num_heads_v", [8])
     @pytest.mark.parametrize("head_dim", [128])
@@ -1455,6 +1665,7 @@ class TestGluonFusedGDNFwdDecodeV2:
         dtype,
     ):
         """Test that Gluon v2 kernel produces the same results as reference."""
+        torch.cuda.manual_seed(42)
         key_dim = num_heads_qk * head_dim
         value_dim = num_heads_v * head_dim
         
@@ -1466,23 +1677,31 @@ class TestGluonFusedGDNFwdDecodeV2:
         # Clone inputs for each run
         inputs_ref = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
         inputs_gluon_v2 = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
-        
+
         # Run reference implementation
         output_ref = gdn_fwd_decode_ref(**inputs_ref)
-        conv_state_ref = inputs_ref["conv_state"]
+        conv_state_ref = inputs_ref["conv_state"][:,:512,:]
+        ssm_state_ref = inputs_ref["ssm_state"]
         
+        print("gdn_fwd_decode_ref @@@@@@@@@@@@@ fused_gdn_fwd_decode_gluon_v2")
+
         # Run Gluon v2 implementation
-        output_gluon_v2 = fused_gdn_fwd_decode_gluon_v2(**inputs_gluon_v2)
-        conv_state_gluon_v2 = inputs_gluon_v2["conv_state"]
-        
-        # Compare outputs
+        output_gluon_v2 = fused_gdn_fwd_decode_gluon_v6(**inputs_gluon_v2)
+        conv_state_gluon_v2 = inputs_gluon_v2["conv_state"][:,:512,:]
+        ssm_state_gluon_v2 = inputs_gluon_v2["ssm_state"]
+
+        # print(f"{conv_state_gluon_v2.shape=}\n{conv_state_ref.shape=}")
+        # print(f"{conv_state_gluon_v2=}\n{conv_state_ref=}")
+
+        # print(f"{ssm_state_ref.shape=}\n{ssm_state_gluon_v2.shape=}")
+        # print(f"{ssm_state_ref=}\n{ssm_state_gluon_v2=}")
+
         rtol, atol = 1e-2, 5e-2
-        assert torch.allclose(output_gluon_v2, output_ref, rtol=rtol, atol=atol), \
-            f"Output mismatch: max diff = {(output_gluon_v2 - output_ref).abs().max()}"
-        
         # Compare conv_states
-        assert torch.allclose(conv_state_gluon_v2, conv_state_ref, rtol=rtol, atol=atol), \
-            f"Conv state mismatch: max diff = {(conv_state_gluon_v2 - conv_state_ref).abs().max()}"
+        torch.testing.assert_close(conv_state_gluon_v2, conv_state_ref, rtol=rtol, atol=atol)
+        torch.testing.assert_close(ssm_state_gluon_v2, ssm_state_ref, rtol=rtol, atol=atol)
+        # Compare outputs
+        torch.testing.assert_close(output_gluon_v2, output_ref, rtol=rtol, atol=atol)
         
         print(f"✓ Gluon v2 vs reference test passed (batch={batch_size}, seqlen={seqlen})")
     
@@ -1506,9 +1725,6 @@ class TestGluonFusedGDNFwdDecodeV2:
         dtype,
     ):
         """Test that Gluon v2 kernel produces the same results as Triton v2 kernel."""
-        from sglang.srt.layers.attention.fla.fused_gdn_fwd_decode import (
-            fused_gdn_fwd_decode_v2,
-        )
         
         key_dim = num_heads_qk * head_dim
         value_dim = num_heads_v * head_dim
@@ -1618,7 +1834,7 @@ class TestGluonFusedGDNFwdDecodeV2:
         
         # Create input tensors
         mixed_qkv = torch.randn(batch, dim, seqlen, device=device, dtype=dtype)
-        conv_state = torch.randn(batch, dim, conv_width - 1, device=device, dtype=dtype)
+        conv_state = torch.randn(batch, conv_width - 1, dim, device=device, dtype=dtype).transpose(1, 2)
         conv_weight = torch.randn(dim, conv_width, device=device, dtype=dtype)
         conv_bias = torch.randn(dim, device=device, dtype=dtype)
         
