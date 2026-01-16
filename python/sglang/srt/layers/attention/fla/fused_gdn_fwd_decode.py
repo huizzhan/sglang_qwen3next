@@ -197,7 +197,7 @@ def fused_gdn_fwd_decode_kernel_v2(
             )
             b_h = tl.load(p_h).to(tl.float32)
 
-            gl.amd.cdna3.sched_barrier(0)
+            tl.debug_barrier()  # Memory barrier to ensure all loads complete
             
             # Pre-load conv_states and weights for Q, K, V
             b_q_conv_states = ()
@@ -651,7 +651,7 @@ def fused_gdn_fwd_decode_kernel(
                 b_q_conv_states = tuple_combine(b_q_conv_states, b_q_conv_state)
             
             # Memory barrier for AMD GPUs to ensure all loads complete
-            gl.amd.cdna3.sched_barrier(0)
+            tl.debug_barrier()
             # ====================================================================
             # Main token processing loop
             # Processing order: K → V (all heads) → Q → Delta Rule (all heads)
@@ -1239,7 +1239,7 @@ def fused_gdn_fwd_decode_kernel_v3(
         b_q_conv_states = tuple_combine(b_q_conv_states, b_q_conv_state)
     
     # Memory barrier for AMD GPUs to ensure all loads complete
-    gl.amd.cdna3.sched_barrier(0)
+    tl.debug_barrier()
     # ====================================================================
     # Main token processing loop
     # Processing order: K → V (all heads) → Q → Delta Rule (all heads)

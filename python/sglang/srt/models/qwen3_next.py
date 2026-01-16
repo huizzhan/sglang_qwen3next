@@ -276,7 +276,11 @@ class Qwen3GatedDeltaNet(nn.Module):
     def _forward_input_proj(self, hidden_states: torch.Tensor):
         DUAL_STREAM_TOKEN_THRESHOLD = 1024 if not _is_npu else 0
         seq_len, _ = hidden_states.shape
-
+        
+        print("================================_forward_input_proj=====================================")
+        print("hidden_states shape: ", hidden_states.shape, "hidden_states stride: ", hidden_states.stride())
+        print("in_proj_qkvz.weight shape: ",self.in_proj_qkvz.weight.shape, "in_proj_qkvz.weight stride: ", self.in_proj_qkvz.weight.stride())
+        print("in_proj_ba.weight shape: ",self.in_proj_ba.weight.shape, "in_proj_ba.weight stride: ", self.in_proj_ba.weight.stride())
         # Ensure attribute exists (do not forcibly create stream if capture logic forbids it)
         if not hasattr(self, "alt_stream"):
             self.alt_stream = None
@@ -309,6 +313,11 @@ class Qwen3GatedDeltaNet(nn.Module):
         else:
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
             projected_states_ba, _ = self.in_proj_ba(hidden_states)
+        
+        print(f"qkvz shape: {projected_states_qkvz.shape}")
+        print(f"ba shape: {projected_states_ba.shape}")
+        print(f"Using dual stream: {seq_len < 1024 and self.alt_stream is not None}")
+        
         return projected_states_qkvz, projected_states_ba
 
     def forward(
@@ -351,11 +360,15 @@ class Qwen3GatedDeltaNet(nn.Module):
             )
             mixed_qkv = torch.cat((query, key, value), dim=-1)
         # mixed_qkv = rearrange(mixed_qkv, "b l d -> b d l")
+        
+        print(f"=====================[forward] self.conv1d.weight size: {self.conv1d.weight.size()}")
 
         # 2. Convolution sequence transformation
         conv_weights = self.conv1d.weight.view(
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         )
+        
+        print(f"=====================[forward] conv_weights shape: {conv_weights.shape}")
 
         kwargs = {
             "mixed_qkv": mixed_qkv,
