@@ -561,7 +561,7 @@ def gluon_causal_conv1d_update_split_qkv_kernel(
     USE_PAD_SLOT: gl.constexpr,
     BLOCK_N: gl.constexpr,
 ):
-    """Gluon version of causal_conv1d_update_split_qkv kernel."""
+    """Gluon version of causal_conv1d_update_split_qkv kernel (original)."""
     
     blocked: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[2],
@@ -691,6 +691,240 @@ def gluon_causal_conv1d_update_split_qkv_kernel(
         gl.store(conv_state_base + l*stride_conv_state_tok, conv_state_vecs[l], idx_feats < dim)
 
 
+@gluon.jit()
+def gluon_causal_conv1d_update_split_qkv_kernel_v2(
+    # Pointers to matrices
+    x_ptr,  # (batch, dim, seqlen) where dim = 2*key_dim + value_dim
+    w_ptr,  # (dim, width)
+    bias_ptr,
+    conv_state_ptr,
+    conv_state_indices_ptr,
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    key_dim: gl.constexpr,
+    value_dim: gl.constexpr,
+    # Matrix dimensions
+    batch: int,
+    dim: gl.constexpr,
+    seqlen: gl.constexpr,
+    state_len: gl.constexpr,
+    num_cache_lines: gl.constexpr,
+    # Strides
+    stride_x_seq: gl.constexpr,
+    stride_x_dim: gl.constexpr,
+    stride_x_token: gl.constexpr,
+    stride_w_dim: gl.constexpr,
+    stride_w_width: gl.constexpr,
+    stride_conv_state_seq: gl.constexpr,
+    stride_conv_state_dim: gl.constexpr,
+    stride_conv_state_tok: gl.constexpr,
+    stride_state_indices: gl.constexpr,
+    stride_q_seq: gl.constexpr,
+    stride_q_dim: gl.constexpr,
+    stride_q_token: gl.constexpr,
+    stride_k_seq: gl.constexpr,
+    stride_k_dim: gl.constexpr,
+    stride_k_token: gl.constexpr,
+    stride_v_seq: gl.constexpr,
+    stride_v_dim: gl.constexpr,
+    stride_v_token: gl.constexpr,
+    # others
+    pad_slot_id: gl.constexpr,
+    # Meta-parameters
+    HAS_BIAS: gl.constexpr,
+    KERNEL_WIDTH: gl.constexpr,
+    SILU_ACTIVATION: gl.constexpr,
+    IS_CONTINUOUS_BATCHING: gl.constexpr,
+    NP2_STATELEN: gl.constexpr,
+    USE_PAD_SLOT: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+):
+    """Gluon version of causal_conv1d_update_split_qkv kernel (optimized v2).
+    
+    Key optimizations:
+    - Eliminates tuple operations in hot loop (tuple_combine, tuple slicing)
+    - Uses explicit variables like Triton version for better register allocation
+    - Reduces memory allocation overhead in inner loop
+    """
+    
+    blocked: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[2],
+        threads_per_warp=[64],
+        warps_per_cta=[2],
+        order=[0],
+    )
+
+    idx_seq = gl.program_id(0)
+    if idx_seq >= batch:
+        return
+
+    # [BLOCK_N,] elements along the feature-dimension (channel)
+    idx_feats = gl.program_id(1) * BLOCK_N + gl.arange(0, BLOCK_N, layout=blocked)
+
+    if IS_CONTINUOUS_BATCHING:
+        conv_state_batch_coord = gl.load(
+            conv_state_indices_ptr + idx_seq * stride_state_indices
+        ).to(gl.int64)
+    else:
+        conv_state_batch_coord = idx_seq
+        
+    if USE_PAD_SLOT:
+        if conv_state_batch_coord == pad_slot_id:
+            return
+
+    # STEP 1: READ initial conv_state data (use explicit variables instead of tuple)
+    conv_states_base = (
+        conv_state_ptr
+        + (conv_state_batch_coord * stride_conv_state_seq)
+        + (idx_feats * stride_conv_state_dim)
+    )
+    mask_w = idx_feats < dim
+
+    prior_tokens = conv_states_base
+    # Use explicit variables like Triton version - avoid tuple operations
+    if KERNEL_WIDTH >= 2:
+        conv_states_ptrs = prior_tokens
+        col0 = gl.load(conv_states_ptrs, mask_w, 0.0)
+    if KERNEL_WIDTH >= 3:
+        conv_states_ptrs = prior_tokens + 1 * stride_conv_state_tok
+        col1 = gl.load(conv_states_ptrs, mask_w, 0.0)
+    if KERNEL_WIDTH >= 4:
+        conv_states_ptrs = prior_tokens + 2 * stride_conv_state_tok
+        col2 = gl.load(conv_states_ptrs, mask_w, 0.0)
+
+    conv_state_base = (
+        conv_state_ptr
+        + (conv_state_batch_coord * stride_conv_state_seq)
+        + (idx_feats * stride_conv_state_dim)
+    )
+
+    # STEP 3: init accumulator
+    if HAS_BIAS:
+        bias = bias_ptr + idx_feats
+        mask_bias = idx_feats < dim
+        acc_preload = gl.load(bias, mask=mask_bias, other=0.0).to(
+            gl.float32
+        )
+    else:
+        acc_preload = gl.zeros((BLOCK_N,), dtype=gl.float32, layout=blocked)
+
+    # STEP 4: PRE-LOAD WEIGHTS (use explicit variables)
+    w_base = w_ptr + (idx_feats * stride_w_dim)
+    mask_w = idx_feats < dim
+    if KERNEL_WIDTH >= 2:
+        w_ptrs = w_base + (0 * stride_w_width)
+        w_col0 = gl.load(w_ptrs, mask_w, other=0.0)
+        w_ptrs = w_base + (1 * stride_w_width)
+        w_col1 = gl.load(w_ptrs, mask_w, other=0.0)
+    if KERNEL_WIDTH >= 3:
+        w_ptrs = w_base + (2 * stride_w_width)
+        w_col2 = gl.load(w_ptrs, mask_w, other=0.0)
+    if KERNEL_WIDTH >= 4:
+        w_ptrs = w_base + (3 * stride_w_width)
+        w_col3 = gl.load(w_ptrs, mask_w, other=0.0)
+
+    x_base_1d = x_ptr + (idx_seq * stride_x_seq) + (idx_feats * stride_x_dim)
+    mask_x_1d = idx_feats < dim
+
+    # STEP 5: compute each token and split to q/k/v
+    # Use explicit variable updates like Triton version - NO tuple operations in loop!
+    for idx_token in gl.static_range(seqlen):
+        acc = acc_preload
+
+        # Initialize matrix_w and matrix_x for first iteration
+        matrix_w = w_col0
+        matrix_x = col0
+        
+        # Compute convolution using explicit conditionals (like Triton)
+        for j in gl.static_range(KERNEL_WIDTH):
+            if KERNEL_WIDTH == 2:
+                if j == 1:
+                    matrix_w = w_col1
+                    x_ptrs_1d = x_base_1d + idx_token * stride_x_token
+                    matrix_x = gl.load(x_ptrs_1d, mask=mask_x_1d)
+            elif KERNEL_WIDTH == 3:
+                if j == 1:
+                    matrix_w = w_col1
+                    matrix_x = col1
+                elif j == 2:
+                    matrix_w = w_col2
+                    x_ptrs_1d = x_base_1d + idx_token * stride_x_token
+                    matrix_x = gl.load(x_ptrs_1d, mask=mask_x_1d)
+            elif KERNEL_WIDTH == 4:
+                if j == 1:
+                    matrix_w = w_col1
+                    matrix_x = col1
+                elif j == 2:
+                    matrix_w = w_col2
+                    matrix_x = col2
+                elif j == 3:
+                    matrix_w = w_col3
+                    x_ptrs_1d = x_base_1d + idx_token * stride_x_token
+                    matrix_x = gl.load(x_ptrs_1d, mask=mask_x_1d)
+
+            acc += matrix_x * matrix_w
+
+        # Update sliding window with simple variable assignments (like Triton)
+        if KERNEL_WIDTH == 2:
+            col0 = matrix_x
+        elif KERNEL_WIDTH == 3:
+            col0 = col1
+            col1 = matrix_x
+        elif KERNEL_WIDTH == 4:
+            col0 = col1
+            col1 = col2
+            col2 = matrix_x
+
+        # Apply activation
+        if SILU_ACTIVATION:
+            acc = acc / (1 + gl.exp(-acc))
+
+        mask_feat = (idx_token < seqlen) & (idx_feats < dim)
+        
+        # Split and store to q, k, v
+        # Query: idx_feats in [0, key_dim)
+        is_query = idx_feats < key_dim
+        q_feat_idx = idx_feats
+        q_ptrs = (
+            q_ptr
+            + idx_seq * stride_q_seq
+            + idx_token * stride_q_token
+            + q_feat_idx * stride_q_dim
+        )
+        gl.store(q_ptrs, acc, mask=mask_feat & is_query)
+        
+        # Key: idx_feats in [key_dim, 2*key_dim)
+        is_key = (idx_feats >= key_dim) & (idx_feats < 2 * key_dim)
+        k_feat_idx = idx_feats - key_dim
+        k_ptrs = (
+            k_ptr
+            + idx_seq * stride_k_seq
+            + idx_token * stride_k_token
+            + k_feat_idx * stride_k_dim
+        )
+        gl.store(k_ptrs, acc, mask=mask_feat & is_key)
+        
+        # Value: idx_feats in [2*key_dim, 2*key_dim+value_dim)
+        is_value = (idx_feats >= 2 * key_dim) & (idx_feats < 2 * key_dim + value_dim)
+        v_feat_idx = idx_feats - 2 * key_dim
+        v_ptrs = (
+            v_ptr
+            + idx_seq * stride_v_seq
+            + idx_token * stride_v_token
+            + v_feat_idx * stride_v_dim
+        )
+        gl.store(v_ptrs, acc, mask=mask_feat & is_value)
+
+    # Store final conv_state using explicit variables
+    if KERNEL_WIDTH >= 2:
+        gl.store(conv_state_base + 0*stride_conv_state_tok, col0, idx_feats < dim)
+    if KERNEL_WIDTH >= 3:
+        gl.store(conv_state_base + 1*stride_conv_state_tok, col1, idx_feats < dim)
+    if KERNEL_WIDTH >= 4:
+        gl.store(conv_state_base + 2*stride_conv_state_tok, col2, idx_feats < dim)
+
+
 def causal_conv1d_update_split_qkv(
     x: torch.Tensor,
     conv_state: torch.Tensor,
@@ -702,6 +936,7 @@ def causal_conv1d_update_split_qkv(
     conv_state_indices: Optional[torch.Tensor] = None,
     pad_slot_id: int = PAD_SLOT_ID,
     use_gluon: bool = True,
+    use_gluon_v2: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Optimized causal_conv1d_update that directly outputs split q, k, v.
     
@@ -716,6 +951,8 @@ def causal_conv1d_update_split_qkv(
         conv_state_indices: Optional batch indices for continuous batching
         pad_slot_id: ID for padded slots
         use_gluon: Whether to use Gluon kernel (default: True)
+        use_gluon_v2: Whether to use optimized Gluon v2 kernel (default: False)
+                      This version eliminates tuple operations for better performance
     
     Returns:
         Tuple of (query, key, value) tensors
@@ -765,7 +1002,11 @@ def causal_conv1d_update_split_qkv(
    
     # print(f"@@@@@@@ causal_conv1d_update_split_qkv {dim=}, {BLOCK_N=}, {batch=}")
     
-    kernel_fn = gluon_causal_conv1d_update_split_qkv_kernel if use_gluon else _causal_conv1d_update_split_qkv_kernel
+    # Select kernel based on flags
+    if use_gluon:
+        kernel_fn = gluon_causal_conv1d_update_split_qkv_kernel_v2 if use_gluon_v2 else gluon_causal_conv1d_update_split_qkv_kernel
+    else:
+        kernel_fn = _causal_conv1d_update_split_qkv_kernel
     
     kernel_fn[grid](
         x_ptr=x,

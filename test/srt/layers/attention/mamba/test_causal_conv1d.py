@@ -13,6 +13,7 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+
 from sglang.srt.layers.attention.mamba.causal_conv1d_split_qkv import (
     causal_conv1d_update_split_qkv,
 )
@@ -154,7 +155,17 @@ def causal_conv1d_opcheck_fn(
 @pytest.mark.parametrize("width", [4])
 # @pytest.mark.parametrize("dim", [2048, 2048 + 16, 4096])
 @pytest.mark.parametrize("dim", [2048])
-def test_causal_conv1d_update(dim, width, seqlen, has_bias, silu_activation, itype):
+# @pytest.mark.parametrize("batch", [1, 8, 64, 128, 256, 512, 1024])
+@pytest.mark.parametrize("batch", [128])
+
+def test_causal_conv1d_update(batch, dim, width, seqlen, has_bias, silu_activation, itype):
+    """
+    Test causal_conv1d_update with correctness check and performance benchmarking.
+    
+    Tests:
+    - Correctness against reference implementation
+    - Performance metrics (throughput and latency)
+    """
     if not torch.cuda.is_available():
         pytest.skip("CUDA device not available")
 
@@ -164,22 +175,87 @@ def test_causal_conv1d_update(dim, width, seqlen, has_bias, silu_activation, ity
         rtol, atol = 1e-2, 5e-2
     # set seed
     torch.manual_seed(0)
-    batch = 2
     x = torch.randn(batch, dim, seqlen, device=device, dtype=itype)
     x_ref = x.clone()
     conv_state = torch.randn(batch, width - 1, dim, device=device, dtype=itype).transpose(1, 2)
+    conv_state_gluon = conv_state.detach().clone()
 
     weight = torch.randn(dim, width, device=device, dtype=itype)
     bias = torch.randn(dim, device=device, dtype=itype) if has_bias else None
     conv_state_ref = conv_state.detach().clone()
     activation = None if not silu_activation else "silu"
-    out = causal_conv1d_update(x, conv_state, weight, bias, activation=activation, validate_data=True)
+    
+    # ============================================================================
+    # Correctness Test: Reference Implementation
+    # ============================================================================
     out_ref = causal_conv1d_update_ref(
         x_ref, conv_state_ref, weight, bias, activation=activation
     )
-
-    assert torch.equal(conv_state, conv_state_ref)
-    assert torch.allclose(out, out_ref, rtol=rtol, atol=atol)
+    
+    # ============================================================================
+    # Correctness Test: Gluon Kernel
+    # ============================================================================
+    print(f"\n{'='*70}")
+    print(f"Correctness Test: Gluon Kernel vs Reference")
+    print(f"{'='*70}")
+    
+    # Run Gluon kernel
+    out_gluon = causal_conv1d_update(
+        x.clone(), conv_state_gluon, weight, bias, 
+        activation=activation
+    )
+    
+    # Check correctness against reference
+    assert torch.allclose(out_gluon, out_ref, rtol=rtol, atol=atol), \
+        f"Gluon output mismatch with reference"
+    assert torch.equal(conv_state_gluon, conv_state_ref), \
+        f"Gluon conv_state mismatch"
+    
+    print(f"  ✓ Correctness check passed!")
+    
+    # ============================================================================
+    # Performance Benchmarking: Gluon Kernel
+    # ============================================================================
+    num_warmup = 10
+    num_iters = 100
+    
+    # Warmup
+    for _ in range(num_warmup):
+        _ = causal_conv1d_update(
+            x.clone(), conv_state_gluon.clone(), weight, bias, 
+            activation=activation
+        )
+    torch.cuda.synchronize()
+    
+    # Benchmark Gluon kernel
+    import time
+    start_time = time.time()
+    for _ in range(num_iters):
+        _ = causal_conv1d_update(
+            x.clone(), conv_state_gluon.clone(), weight, bias, 
+            activation=activation
+        )
+    torch.cuda.synchronize()
+    gluon_time = (time.time() - start_time) / num_iters * 1000  # ms
+    
+    # Calculate metrics
+    total_elements = batch * dim * seqlen
+    throughput = total_elements / gluon_time / 1000  # M elements/s
+    
+    print(f"\nPerformance Results (averaged over {num_iters} iterations):")
+    print(f"\n  Gluon Kernel:")
+    print(f"    - Time per iteration:  {gluon_time:.4f} ms")
+    print(f"    - Throughput:          {throughput:.2f} M elements/s")
+    print(f"    - Configuration:")
+    print(f"      * Batch size:        {batch}")
+    print(f"      * Dimension:         {dim}")
+    print(f"      * Sequence length:   {seqlen}")
+    print(f"      * Kernel width:      {width}")
+    print(f"      * Data type:         {itype}")
+    print(f"      * Activation:        {activation}")
+    print(f"      * Has bias:          {has_bias}")
+    
+    print(f"{'='*70}\n")
 
 
 @pytest.mark.parametrize("itype", [torch.float32, torch.float16, torch.bfloat16])
@@ -388,16 +464,19 @@ def test_causal_conv1d_varlen(
 @pytest.mark.parametrize("width", [4])
 @pytest.mark.parametrize("key_dim", [512])
 @pytest.mark.parametrize("value_dim", [1024])
+# @pytest.mark.parametrize("batch", [1, 8, 64, 128, 256, 512, 1024])
+@pytest.mark.parametrize("batch", [128])
+
 def test_causal_conv1d_update_split_qkv(
-    key_dim, value_dim, width, seqlen, has_bias, silu_activation, itype
+    batch, key_dim, value_dim, width, seqlen, has_bias, silu_activation, itype
 ):
     """
     Test that causal_conv1d_update_split_qkv Triton and Gluon kernels 
     produce the same results, with end-to-end performance benchmarking.
     
     Compares:
-    - Triton kernel vs Gluon kernel for split_qkv implementation
-    - Performance metrics for both implementations
+    - Triton kernel vs Gluon kernel vs Gluon v2 (optimized) kernel
+    - Performance metrics for all three implementations
     """
     if not torch.cuda.is_available():
         pytest.skip("CUDA device not available")
@@ -408,7 +487,6 @@ def test_causal_conv1d_update_split_qkv(
         rtol, atol = 1e-2, 5e-2
 
     torch.manual_seed(42)
-    batch = 1
     dim = 2 * key_dim + value_dim  # Total dimension: q + k + v
     
     # Create input: (batch, dim, seqlen)
@@ -419,16 +497,17 @@ def test_causal_conv1d_update_split_qkv(
         batch, width - 1, dim, device=device, dtype=itype
     ).transpose(1, 2)
     conv_state_gluon = conv_state_triton.detach().clone()
+    conv_state_gluon_v2 = conv_state_triton.detach().clone()
     
     weight = torch.randn(dim, width, device=device, dtype=itype)
     bias = torch.randn(dim, device=device, dtype=itype) if has_bias else None
     activation = None if not silu_activation else "silu"
     
     # ============================================================================
-    # Correctness Test: Triton vs Gluon
+    # Correctness Test: Triton vs Gluon vs Gluon v2
     # ============================================================================
     print(f"\n{'='*70}")
-    print(f"Correctness Test: Triton vs Gluon Kernels")
+    print(f"Correctness Test: Triton vs Gluon vs Gluon v2 Kernels")
     print(f"{'='*70}")
     
     # Run Triton kernel
@@ -443,7 +522,7 @@ def test_causal_conv1d_update_split_qkv(
         use_gluon=False,
     )
     
-    # Run Gluon kernel
+    # Run Gluon kernel (original)
     query_gluon, key_gluon, value_gluon = causal_conv1d_update_split_qkv(
         mixed_qkv.clone(),
         conv_state_gluon,
@@ -453,6 +532,20 @@ def test_causal_conv1d_update_split_qkv(
         bias=bias,
         activation=activation,
         use_gluon=True,
+        use_gluon_v2=False,
+    )
+    
+    # Run Gluon v2 kernel (optimized)
+    query_gluon_v2, key_gluon_v2, value_gluon_v2 = causal_conv1d_update_split_qkv(
+        mixed_qkv.clone(),
+        conv_state_gluon_v2,
+        weight,
+        key_dim=key_dim,
+        value_dim=value_dim,
+        bias=bias,
+        activation=activation,
+        use_gluon=True,
+        use_gluon_v2=True,
     )
     
     # Compare outputs
@@ -461,7 +554,7 @@ def test_causal_conv1d_update_split_qkv(
     # print(f"  Key:   {key_triton.shape}")
     # print(f"  Value: {value_triton.shape}")
     
-    # Check if outputs match
+    # Check if outputs match - Triton vs Gluon
     # query_diff = (query_triton - query_gluon).abs().max().item()
     # key_diff = (key_triton - key_gluon).abs().max().item()
     # value_diff = (value_triton - value_gluon).abs().max().item()
@@ -473,6 +566,7 @@ def test_causal_conv1d_update_split_qkv(
     # print(f"  Value: {value_diff:.6e}")
     # print(f"  State: {state_diff:.6e}")
     
+    # Triton vs Gluon (original)
     assert torch.allclose(query_triton, query_gluon, rtol=rtol, atol=atol)
         # f"Query mismatch: max diff = {query_diff}"
     assert torch.allclose(key_triton, key_gluon, rtol=rtol, atol=atol)
@@ -482,10 +576,25 @@ def test_causal_conv1d_update_split_qkv(
     assert torch.allclose(conv_state_triton, conv_state_gluon, rtol=rtol, atol=atol)
         # f"Conv state mismatch: max diff = {state_diff}"
     
-    print(f"  ✓ Correctness check passed!")
+    # Triton vs Gluon v2 (optimized)
+    assert torch.allclose(query_triton, query_gluon_v2, rtol=rtol, atol=atol)
+    assert torch.allclose(key_triton, key_gluon_v2, rtol=rtol, atol=atol)
+    assert torch.allclose(value_triton, value_gluon_v2, rtol=rtol, atol=atol)
+    assert torch.allclose(conv_state_triton, conv_state_gluon_v2, rtol=rtol, atol=atol)
+    
+    # Gluon vs Gluon v2
+    assert torch.allclose(query_gluon, query_gluon_v2, rtol=rtol, atol=atol)
+    assert torch.allclose(key_gluon, key_gluon_v2, rtol=rtol, atol=atol)
+    assert torch.allclose(value_gluon, value_gluon_v2, rtol=rtol, atol=atol)
+    assert torch.allclose(conv_state_gluon, conv_state_gluon_v2, rtol=rtol, atol=atol)
+    
+    print(f"  ✓ Triton vs Gluon:    Passed")
+    print(f"  ✓ Triton vs Gluon v2: Passed")
+    print(f"  ✓ Gluon vs Gluon v2:  Passed")
+    print(f"  ✓ All correctness checks passed!")
     
     # ============================================================================
-    # Performance Benchmarking: Triton vs Gluon
+    # Performance Benchmarking: Triton vs Gluon vs Gluon v2
     # ============================================================================
     # print(f"\n{'='*70}")
     # print(f"End-to-End Performance Benchmark")
@@ -512,7 +621,12 @@ def test_causal_conv1d_update_split_qkv(
         _ = causal_conv1d_update_split_qkv(
             mixed_qkv.clone(), conv_state_gluon.clone(), weight,
             key_dim=key_dim, value_dim=value_dim, bias=bias, activation=activation,
-            use_gluon=True,
+            use_gluon=True, use_gluon_v2=False,
+        )
+        _ = causal_conv1d_update_split_qkv(
+            mixed_qkv.clone(), conv_state_gluon_v2.clone(), weight,
+            key_dim=key_dim, value_dim=value_dim, bias=bias, activation=activation,
+            use_gluon=True, use_gluon_v2=True,
         )
     torch.cuda.synchronize()
     
@@ -528,41 +642,68 @@ def test_causal_conv1d_update_split_qkv(
     torch.cuda.synchronize()
     triton_time = (time.time() - start_time) / num_iters * 1000  # ms
     
-    # Benchmark Gluon kernel
+    # Benchmark Gluon kernel (original)
     start_time = time.time()
     for _ in range(num_iters):
         _ = causal_conv1d_update_split_qkv(
             mixed_qkv.clone(), conv_state_gluon.clone(), weight,
             key_dim=key_dim, value_dim=value_dim, bias=bias, activation=activation,
-            use_gluon=True,
+            use_gluon=True, use_gluon_v2=False,
         )
     torch.cuda.synchronize()
     gluon_time = (time.time() - start_time) / num_iters * 1000  # ms
     
+    # Benchmark Gluon v2 kernel (optimized)
+    start_time = time.time()
+    for _ in range(num_iters):
+        _ = causal_conv1d_update_split_qkv(
+            mixed_qkv.clone(), conv_state_gluon_v2.clone(), weight,
+            key_dim=key_dim, value_dim=value_dim, bias=bias, activation=activation,
+            use_gluon=True, use_gluon_v2=True,
+        )
+    torch.cuda.synchronize()
+    gluon_v2_time = (time.time() - start_time) / num_iters * 1000  # ms
+    
     # Calculate metrics
     total_elements = batch * dim * seqlen
-    speedup = triton_time / gluon_time
-    time_saved = triton_time - gluon_time
+    speedup_gluon_vs_triton = triton_time / gluon_time
+    speedup_gluon_v2_vs_triton = triton_time / gluon_v2_time
+    speedup_gluon_v2_vs_gluon = gluon_time / gluon_v2_time
     
     print(f"\nPerformance Results (averaged over {num_iters} iterations):")
     print(f"\n  Triton Kernel:")
     print(f"    - Time per iteration:  {triton_time:.4f} ms")
     print(f"    - Throughput:          {total_elements / triton_time / 1000:.2f} M elements/s")
     
-    print(f"\n  Gluon Kernel:")
+    print(f"\n  Gluon Kernel (original):")
     print(f"    - Time per iteration:  {gluon_time:.4f} ms")
     print(f"    - Throughput:          {total_elements / gluon_time / 1000:.2f} M elements/s")
+    print(f"    - vs Triton:           {speedup_gluon_vs_triton:.3f}x")
     
-    print(f"\n  Performance Comparison:")
-    print(f"    - Speedup (Gluon/Triton): {speedup:.2f}x")
-    print(f"    - Time difference:        {abs(time_saved):.4f} ms ({abs(time_saved)/max(triton_time, gluon_time)*100:.1f}%)")
+    print(f"\n  Gluon v2 Kernel (optimized):")
+    print(f"    - Time per iteration:  {gluon_v2_time:.4f} ms")
+    print(f"    - Throughput:          {total_elements / gluon_v2_time / 1000:.2f} M elements/s")
+    print(f"    - vs Triton:           {speedup_gluon_v2_vs_triton:.3f}x")
+    print(f"    - vs Gluon:            {speedup_gluon_v2_vs_gluon:.3f}x")
     
-    if speedup > 1.05:
-        print(f"    - Status:                 ✓ Gluon is {speedup:.2f}x FASTER")
-    elif speedup < 0.95:
-        print(f"    - Status:                 ⚠ Triton is {1/speedup:.2f}x FASTER")
+    print(f"\n  Performance Summary:")
+    print(f"    - Best performer:      ", end="")
+    best_time = min(triton_time, gluon_time, gluon_v2_time)
+    if best_time == triton_time:
+        print(f"Triton ({triton_time:.4f} ms)")
+    elif best_time == gluon_time:
+        print(f"Gluon ({gluon_time:.4f} ms)")
     else:
-        print(f"    - Status:                 ≈ Performance is similar")
+        print(f"Gluon v2 ({gluon_v2_time:.4f} ms) ✓")
+    
+    print(f"    - Gluon v2 improvement: {speedup_gluon_v2_vs_gluon:.2f}x faster than original Gluon")
+    
+    if speedup_gluon_v2_vs_gluon > 1.1:
+        print(f"    - Status:              ✓ Gluon v2 optimization EFFECTIVE ({(speedup_gluon_v2_vs_gluon-1)*100:.1f}% faster)")
+    elif speedup_gluon_v2_vs_gluon < 0.9:
+        print(f"    - Status:              ⚠ Gluon v2 SLOWER than original")
+    else:
+        print(f"    - Status:              ≈ Similar performance")
     
     print(f"{'='*70}\n")
 
