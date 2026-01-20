@@ -1076,13 +1076,13 @@ class TestGluonFusedGDNFwdDecode:
         print("  - Perfetto: https://ui.perfetto.dev/")
         print(f"{'='*70}\n")
     
-    @pytest.mark.parametrize("batch_size", [64])
+    @pytest.mark.parametrize("batch_size", [128])
     def test_three_way_performance_comparison(self, batch_size, device, dtype):
         """
         Benchmark performance comparison of three implementations:
         1. gdn_fwd_decode_ref (Python reference)
-        2. fused_gdn_fwd_decode_gluon (Gluon v1, Q/K-indexed)
-        3. fused_gdn_fwd_decode_gluon_v2 (Gluon v2, V-indexed)
+        2. fused_gdn_fwd_decode_gluon_v2 (Gluon v2, Q/K-indexed)
+        3. fused_gdn_fwd_decode_gluon_v6 (Gluon v6, V-indexed)
         """
         num_heads_qk = 4
         num_heads_v = 8
@@ -1166,7 +1166,7 @@ class TestGluonFusedGDNFwdDecode:
         
         # Warmup
         for _ in range(3):
-            _ = fused_gdn_fwd_decode_gluon(
+            _ = fused_gdn_fwd_decode_gluon_v2(
                 mixed_qkv=mixed_qkv,
                 conv_state=conv_state,
                 conv_weight=inputs["conv_weight"],
@@ -1192,7 +1192,7 @@ class TestGluonFusedGDNFwdDecode:
         torch.cuda.synchronize()
         start = time.time()
         for _ in range(num_iters):
-            _ = fused_gdn_fwd_decode_gluon(
+            _ = fused_gdn_fwd_decode_gluon_v2(
                 mixed_qkv=mixed_qkv,
                 conv_state=conv_state,
                 conv_weight=inputs["conv_weight"],

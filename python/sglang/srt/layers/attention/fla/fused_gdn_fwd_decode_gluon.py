@@ -2459,6 +2459,9 @@ def gluon_fused_gdn_fwd_decode_kernel_v6(
     i_k: gl.constexpr = 0
     i_v: gl.constexpr = 0
 
+    # Number of V heads per Q/K head (group size) - MUST be defined before use
+    GROUP_SIZE: gl.constexpr = HV // H
+
     o_k = i_k * BK + gl.arange(0, BK, layout=blocked_k)
     o_v = i_v * BV + gl.arange(0, BV, layout=blocked_v)
 
@@ -2478,9 +2481,6 @@ def gluon_fused_gdn_fwd_decode_kernel_v6(
         i_n = batch_idx * cu_tasks + task_idx + cu_offs
 
         # tl.device_print("", i_n)
-    
-        # Number of V heads per Q/K head (group size)
-        GROUP_SIZE: gl.constexpr = HV // H
         
         # Handle variable length sequences
         if IS_VARLEN:

@@ -278,16 +278,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
         cache_indices = self.forward_metadata.mamba_cache_indices
 
         # Log tensor dimensions
-        print("="*80)
-        print(f"[forward_decode] Layer {layer_id} - Tensor Dimensions:")
-        print(f"  conv_weights shape: {conv_weights.shape}")
-        print(f"  conv_states shape: {conv_states.shape}")
-        print(f"  ssm_states shape: {ssm_states.shape}")
-        print(f"  mixed_qkv shape: {mixed_qkv.shape}")
-        print(f"  cache_indices: {cache_indices.shape if cache_indices is not None else None}")
-        print("="*80)
+        # print("="*80)
+        # print(f"[forward_decode] Layer {layer_id} - Tensor Dimensions:")
+        # print(f"  conv_weights shape: {conv_weights.shape}")
+        # print(f"  conv_states shape: {conv_states.shape}")
+        # print(f"  ssm_states shape: {ssm_states.shape}")
+        # print(f"  mixed_qkv shape: {mixed_qkv.shape}")
+        # print(f"  cache_indices: {cache_indices.shape if cache_indices is not None else None}")
+        # print("="*80)
         
-        # if _is_hip:
+        # if false:
         #     query, key, value = causal_conv1d_update_split_qkv(
         #         mixed_qkv,
         #         conv_states,
@@ -298,6 +298,89 @@ class GDNAttnBackend(MambaAttnBackendBase):
         #         activation=activation,
         #         conv_state_indices=cache_indices,
         #     )
+        # else:
+        mixed_qkv = causal_conv1d_update(
+            mixed_qkv,
+            conv_states,
+            conv_weights,
+            bias,
+            activation,
+            conv_state_indices=cache_indices,
+        )
+        query, key, value = torch.split(
+            mixed_qkv,
+            [
+                key_dim // attn_tp_size,
+                key_dim // attn_tp_size,
+                value_dim // attn_tp_size,
+            ],
+            dim=-1,
+        )
+        seq_len = query.shape[0]
+        num_heads = query.shape[1] // head_k_dim
+        query = query.view(1, seq_len, num_heads, head_k_dim)
+        key = key.view(1, seq_len, num_heads, head_k_dim)
+        value = value.view(1, seq_len, value.shape[1] // head_v_dim, head_v_dim)
+
+        core_attn_out = fused_sigmoid_gating_delta_rule_update(
+            A_log=A_log,
+            dt_bias=dt_bias,
+            q=query,
+            k=key,
+            v=value,
+            a=a,
+            b=b,
+            initial_state_source=ssm_states,
+            initial_state_indices=cache_indices,
+            cu_seqlens=query_start_loc,
+            use_qk_l2norm_in_kernel=True,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+        )
+
+        return core_attn_out
+        # if _is_hip:
+        #     # 使用融合的 Gluon v2 kernel 一次性完成 Conv1D + Gating + Delta Rule
+        #     seq_len = mixed_qkv.shape[0]
+        #     num_heads_qk = (key_dim // attn_tp_size) // head_k_dim
+        #     num_heads_v = (value_dim // attn_tp_size) // head_v_dim
+            
+        #     # 重塑 mixed_qkv 为 (batch, dim, seqlen)
+        #     batch_size = seq_len  # decode 阶段每个 token 一个 batch
+        #     mixed_qkv_reshaped = mixed_qkv.view(batch_size, -1, 1)  # (seq_len, dim, 1)
+            
+        #     # 调用融合 kernel
+        #     core_attn_out = fused_gdn_fwd_decode_gluon_v2(
+        #         mixed_qkv=mixed_qkv_reshaped,
+        #         conv_state=conv_states,
+        #         conv_weight=conv_weights,
+        #         A_log=A_log,
+        #         a=a,
+        #         dt_bias=dt_bias,
+        #         b=b,
+        #         ssm_state=ssm_states,
+        #         key_dim=key_dim // attn_tp_size,
+        #         value_dim=value_dim // attn_tp_size,
+        #         num_heads_qk=num_heads_qk,
+        #         num_heads_v=num_heads_v,
+        #         head_dim=head_k_dim,
+        #         conv_bias=bias,
+        #         activation=activation,
+        #         conv_state_indices=cache_indices,
+        #         ssm_state_indices=cache_indices,
+        #         pad_slot_id=PAD_SLOT_ID,
+        #         scale=None,  # 使用默认的 head_dim^-0.5
+        #         use_qk_l2norm_in_kernel=True,
+        #         softplus_beta=1.0,
+        #         softplus_threshold=20.0,
+        #         cu_seqlens=query_start_loc,
+        #     )
+            
+        #     # 输出形状: (batch, seqlen, num_heads_v, head_dim)
+        #     # 需要 reshape 到期望的格式
+        #     core_attn_out = core_attn_out.squeeze(1)  # 移除 seqlen 维度（decode时为1）
+            
+        #     return core_attn_out
         # else:
         #     mixed_qkv = causal_conv1d_update(
         #         mixed_qkv,
@@ -316,112 +399,27 @@ class GDNAttnBackend(MambaAttnBackendBase):
         #         ],
         #         dim=-1,
         #     )
-        # seq_len = query.shape[0]
-        # num_heads = query.shape[1] // head_k_dim
-        # query = query.view(1, seq_len, num_heads, head_k_dim)
-        # key = key.view(1, seq_len, num_heads, head_k_dim)
-        # value = value.view(1, seq_len, value.shape[1] // head_v_dim, head_v_dim)
+        #     seq_len = query.shape[0]
+        #     num_heads = query.shape[1] // head_k_dim
+        #     query = query.view(1, seq_len, num_heads, head_k_dim)
+        #     key = key.view(1, seq_len, num_heads, head_k_dim)
+        #     value = value.view(1, seq_len, value.shape[1] // head_v_dim, head_v_dim)
 
-        # core_attn_out = fused_sigmoid_gating_delta_rule_update(
-        #     A_log=A_log,
-        #     dt_bias=dt_bias,
-        #     q=query,
-        #     k=key,
-        #     v=value,
-        #     a=a,
-        #     b=b,
-        #     initial_state_source=ssm_states,
-        #     initial_state_indices=cache_indices,
-        #     cu_seqlens=query_start_loc,
-        #     use_qk_l2norm_in_kernel=True,
-        #     softplus_beta=1.0,
-        #     softplus_threshold=20.0,
-        # )
-
-        # return core_attn_out
-        if _is_hip:
-            # 使用融合的 Gluon v2 kernel 一次性完成 Conv1D + Gating + Delta Rule
-            seq_len = mixed_qkv.shape[0]
-            num_heads_qk = (key_dim // attn_tp_size) // head_k_dim
-            num_heads_v = (value_dim // attn_tp_size) // head_v_dim
-            
-            # 重塑 mixed_qkv 为 (batch, dim, seqlen)
-            batch_size = seq_len  # decode 阶段每个 token 一个 batch
-            mixed_qkv_reshaped = mixed_qkv.view(batch_size, -1, 1)  # (seq_len, dim, 1)
-            
-            # 调用融合 kernel
-            core_attn_out = fused_gdn_fwd_decode_gluon_v2(
-                mixed_qkv=mixed_qkv_reshaped,
-                conv_state=conv_states,
-                conv_weight=conv_weights,
-                A_log=A_log,
-                a=a,
-                dt_bias=dt_bias,
-                b=b,
-                ssm_state=ssm_states,
-                key_dim=key_dim // attn_tp_size,
-                value_dim=value_dim // attn_tp_size,
-                num_heads_qk=num_heads_qk,
-                num_heads_v=num_heads_v,
-                head_dim=head_k_dim,
-                conv_bias=bias,
-                activation=activation,
-                conv_state_indices=cache_indices,
-                ssm_state_indices=cache_indices,
-                pad_slot_id=PAD_SLOT_ID,
-                scale=None,  # 使用默认的 head_dim^-0.5
-                use_qk_l2norm_in_kernel=True,
-                softplus_beta=1.0,
-                softplus_threshold=20.0,
-                cu_seqlens=query_start_loc,
-            )
-            
-            # 输出形状: (batch, seqlen, num_heads_v, head_dim)
-            # 需要 reshape 到期望的格式
-            core_attn_out = core_attn_out.squeeze(1)  # 移除 seqlen 维度（decode时为1）
-            
-            return core_attn_out
-        else:
-            mixed_qkv = causal_conv1d_update(
-                mixed_qkv,
-                conv_states,
-                conv_weights,
-                bias,
-                activation,
-                conv_state_indices=cache_indices,
-            )
-            query, key, value = torch.split(
-                mixed_qkv,
-                [
-                    key_dim // attn_tp_size,
-                    key_dim // attn_tp_size,
-                    value_dim // attn_tp_size,
-                ],
-                dim=-1,
-            )
-            seq_len = query.shape[0]
-            num_heads = query.shape[1] // head_k_dim
-            query = query.view(1, seq_len, num_heads, head_k_dim)
-            key = key.view(1, seq_len, num_heads, head_k_dim)
-            value = value.view(1, seq_len, value.shape[1] // head_v_dim, head_v_dim)
-
-            core_attn_out = fused_sigmoid_gating_delta_rule_update(
-                A_log=A_log,
-                dt_bias=dt_bias,
-                q=query,
-                k=key,
-                v=value,
-                a=a,
-                b=b,
-                initial_state_source=ssm_states,
-                initial_state_indices=cache_indices,
-                cu_seqlens=query_start_loc,
-                use_qk_l2norm_in_kernel=True,
-                softplus_beta=1.0,
-                softplus_threshold=20.0,
-            )
-
-            return core_attn_out
+        #     core_attn_out = fused_sigmoid_gating_delta_rule_update(
+        #         A_log=A_log,
+        #         dt_bias=dt_bias,
+        #         q=query,
+        #         k=key,
+        #         v=value,
+        #         a=a,
+        #         b=b,
+        #         initial_state_source=ssm_states,
+        #         initial_state_indices=cache_indices,
+        #         cu_seqlens=query_start_loc,
+        #         use_qk_l2norm_in_kernel=True,
+        #         softplus_beta=1.0,
+        #         softplus_threshold=20.0,
+        #     )
 
     def forward_extend(
         self,

@@ -636,7 +636,7 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
     """Start profiling."""
     if obj is None:
         obj = ProfileReqInput(
-            output_dir="/workspace/project/GDN/qwen3_next_profile_fp8"
+            output_dir="/workspace/project/GDN/qwen3_next_profile_gluon_conv1d_bs64"
         )
 
     await _global_state.tokenizer_manager.start_profile(
