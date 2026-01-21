@@ -1146,9 +1146,9 @@ def gluon_causal_conv1d_update_persistent_kernel(
 ):
 
     blocked: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[2],
+        size_per_thread=[1],
         threads_per_warp=[64],
-        warps_per_cta=[2],
+        warps_per_cta=[16],
         order=[0],
     )
 
@@ -1669,9 +1669,9 @@ def causal_conv1d_update_persistent(
         IS_SPEC_DECODING=num_accepted_tokens is not None,
         NP2_STATELEN=np2_statelen,
         USE_PAD_SLOT=pad_slot_id is not None,
-        BLOCK_N=256,
+        BLOCK_N=2048,
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
-        num_warps=2
+        num_warps=16
     )
     if unsqueeze:
         out = out.squeeze(-1)
