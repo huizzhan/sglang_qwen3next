@@ -12,6 +12,45 @@ import triton.language as tl
 
 PAD_SLOT_ID = -1
 
+import os
+os.environ["TRITON_PRINT_AUTOTUNING"] = "1"  # 显示 autotune 过程和结果
+# os.environ["TRITON_CACHE_DIR"] = "/sgl-workspace/sglang/conv1d_gluon_cache_opt1"
+# os.environ["MLIR_ENABLE_DUMP"] = "1"
+# os.environ["AMDGCN_ENABLE_DUMP"] = "1"
+
+
+def make_block_layout_conv1d(w_ptr: torch.Tensor, block_size: int, num_warps: int):
+    """
+    为 conv1d kernel 动态计算 BlockedLayout
+    
+    Args:
+        w_ptr: weight 张量（用于检查 dtype）
+        block_size: BLOCK_N 大小
+        num_warps: warp 数量
+    
+    Returns:
+        gl.BlockedLayout: 优化后的数据布局
+    """
+    # 计算 size_per_thread
+    # 对于 conv1d，我们使用简单的 1D 布局
+    thread_nums = 64  # 每个 warp 的线程数
+    vec = 2
+    
+    # # 根据 dtype 和 block_size 计算合适的 size_per_thread
+    # bits = torch.finfo(w_ptr.dtype).bits if w_ptr.dtype.is_floating_point else 16
+    # thread_load_bits = 128  # 每个线程加载的比特数
+    
+    # # 计算向量化大小
+    # vec = min(thread_load_bits // bits, block_size)
+    # vec = min(vec, block_size // (thread_nums * num_warps))
+    # vec = max(vec, 1)  # 至少为 1
+    
+    return gl.BlockedLayout(
+        size_per_thread=[vec],
+        threads_per_warp=[thread_nums],
+        warps_per_cta=[num_warps],
+        order=[0],
+    )
 
 @triton.jit()
 def _causal_conv1d_fwd_kernel(  # continuous batching
@@ -1640,6 +1679,33 @@ def gluon_causal_conv1d_update_persistent_kernel(
             for l in gl.static_range(state_len):
                 gl.store(conv_state_base + l*stride_conv_state_tok, conv_state_vecs[l], idx_feats < dim)
 
+@triton.autotune(
+    configs=[
+        # 调优 BLOCK_N、waves_per_eu 和 NUM_WARPS
+        # 保持关系: BLOCK_N = size_per_thread × 64 × NUM_WARPS (size_per_thread 由 heuristics 自动计算)
+        # 注意：autotune 同时测试多个配置时可能遇到 Gluon 编译器 bug
+        # 建议：先单独测试每个配置确保正确性，然后再启用多个配置
+        # triton.Config({'BLOCK_N': 2048}, num_warps=16, num_stages=1),
+        # triton.Config({'BLOCK_N': 2048}, num_warps=16, num_stages=2),
+        # triton.Config({'BLOCK_N': 2048}, num_warps=16, num_stages=3),
+        # triton.Config({'BLOCK_N': 2048}, num_warps=16, num_stages=4),
+        triton.Config({'BLOCK_N': 1024}, num_warps=8, num_stages=1),
+        # triton.Config({'BLOCK_N': 256}, num_warps=4, num_stages=1),
+        # triton.Config({'BLOCK_N': 512, 'waves_per_eu': 1, 'NUM_WARPS': 8}, num_warps=8, num_stages=1),
+        # triton.Config({'BLOCK_N': 1024, 'waves_per_eu': 2, 'NUM_WARPS': 8}, num_warps=8, num_stages=2),
+        # triton.Config({'BLOCK_N': 2048, 'waves_per_eu': 4, 'NUM_WARPS': 16}, num_warps=16, num_stages=1),
+        # triton.Config({'BLOCK_N': 2048, 'waves_per_eu': 4, 'NUM_WARPS': 16}, num_warps=16, num_stages=2),
+    ],
+    key=['dim'],  # key 参数决定何时重新 autotune
+    reset_to_zero=['o_ptr'],  # 在测试不同配置时重置输出，防止结果累积
+)
+@triton.heuristics(values={
+    'blocked': lambda args: make_block_layout_conv1d(
+        args['x_ptr'],  # 使用 w_ptr 获取 dtype（x_ptr 和 w_ptr 的 dtype 应该相同）
+        args['BLOCK_N'], 
+        args['num_warps']
+    )
+})
 @gluon.jit()
 def gluon_causal_conv1d_update_persistent_kernel_v2(
     # Pointers to matrices
@@ -1687,14 +1753,9 @@ def gluon_causal_conv1d_update_persistent_kernel_v2(
     USE_PAD_SLOT: gl.constexpr,
     BLOCK_N: gl.constexpr,
     SAVE_INTERMEDIATE: gl.constexpr,
+    num_warps: gl.constexpr,
+    blocked: gl.constexpr,  # 通过 heuristics 动态计算
 ):
-
-    blocked: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1],
-        threads_per_warp=[64],
-        warps_per_cta=[16],
-        order=[0],
-    )
 
     cu_idx = gl.program_id(0)  # Current CU ID (0-79)
     num_cus = 80                # Fixed number of CUs
@@ -2526,9 +2587,7 @@ def causal_conv1d_update_persistent_v2(
         IS_SPEC_DECODING=num_accepted_tokens is not None,
         NP2_STATELEN=np2_statelen,
         USE_PAD_SLOT=pad_slot_id is not None,
-        BLOCK_N=2048,
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
-        num_warps=16
     )
     if unsqueeze:
         out = out.squeeze(-1)

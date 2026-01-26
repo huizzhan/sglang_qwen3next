@@ -38,10 +38,10 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
 # ============================================================================
 
 KERNELS_TO_TEST = [
-    (causal_conv1d_update, "Gluon Kernel"),
+    # (causal_conv1d_update, "Gluon Kernel"),
     (causal_conv1d_update_persistent, "Persistent Kernel"),
-    (causal_conv1d_update_v2, "V2 Kernel"),
     (causal_conv1d_update_persistent_v2, "Persistent v2"),
+    # (causal_conv1d_update_v2, "V2 Kernel"),
     # 添加更多 kernel（取消注释以启用）:
     # (causal_conv1d_update, "Gluon (Duplicate Test)"),  # 测试重复添加
     # (your_new_kernel_func, "Your Custom Kernel Name"),
@@ -49,9 +49,9 @@ KERNELS_TO_TEST = [
 
 # KERNELS_TO_TEST = [
 #     (causal_conv1d_update, "Gluon Kernel"),
+#     (causal_conv1d_update_persistent_v2, "Persistent v2"),
 #     (causal_conv1d_update_persistent, "Persistent Kernel"),
 #     (causal_conv1d_update_v2, "V2 Kernel"),
-#     (causal_conv1d_update_persistent_v2, "Persistent v2"),
 #     # 添加更多 kernel（取消注释以启用）:
 #     # (causal_conv1d_update, "Gluon (Duplicate Test)"),  # 测试重复添加
 #     # (your_new_kernel_func, "Your Custom Kernel Name"),
@@ -92,9 +92,20 @@ def test_kernel_correctness(
             activation=activation, conv_state_indices=conv_state_indices
         )
         
-        # 检查输出正确性
+        # 检查输出正确性 - 添加详细调试信息
+        max_diff = (out_test - out_ref).abs().max().item()
+        mean_diff = (out_test - out_ref).abs().mean().item()
+        if not torch.allclose(out_test, out_ref, rtol=rtol, atol=atol):
+            print(f"  ✗ 输出不匹配:")
+            print(f"    - Max diff: {max_diff:.6e}")
+            print(f"    - Mean diff: {mean_diff:.6e}")
+            print(f"    - rtol: {rtol}, atol: {atol}")
+            print(f"    - out_test shape: {out_test.shape}")
+            print(f"    - out_ref shape: {out_ref.shape}")
+            print(f"    - out_test sample: {out_test.flatten()[:5]}")
+            print(f"    - out_ref sample: {out_ref.flatten()[:5]}")
         assert torch.allclose(out_test, out_ref, rtol=rtol, atol=atol), \
-            f"{kernel_name} 输出与参考实现不匹配"
+            f"{kernel_name} 输出与参考实现不匹配 (max_diff={max_diff:.6e}, mean_diff={mean_diff:.6e})"
         
         # 检查 conv_state 正确性
         assert torch.allclose(
