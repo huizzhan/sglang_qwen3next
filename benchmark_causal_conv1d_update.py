@@ -13,6 +13,7 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
     causal_conv1d_update_v2,
     causal_conv1d_update_persistent,
+    causal_conv1d_update_persistent_v1,
     causal_conv1d_update_persistent_v2,
 )
 
@@ -39,8 +40,10 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
 
 KERNELS_TO_TEST = [
     # (causal_conv1d_update, "Gluon Kernel"),
-    (causal_conv1d_update_persistent, "Persistent Kernel"),
     (causal_conv1d_update_persistent_v2, "Persistent v2"),
+    (causal_conv1d_update_persistent, "Persistent Kernel"),
+    (causal_conv1d_update_persistent_v1, "Persistent v1"),
+    # (causal_conv1d_update_persistent_v2, "Persistent v2"),
     # (causal_conv1d_update_v2, "V2 Kernel"),
     # 添加更多 kernel（取消注释以启用）:
     # (causal_conv1d_update, "Gluon (Duplicate Test)"),  # 测试重复添加
