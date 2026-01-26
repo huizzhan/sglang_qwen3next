@@ -175,7 +175,7 @@ def causal_conv1d_opcheck_fn(
 @pytest.mark.parametrize("itype", [torch.bfloat16])
 # @pytest.mark.parametrize("silu_activation", [False, True])
 # @pytest.mark.parametrize("has_bias", [False, True])
-@pytest.mark.parametrize("silu_activation", [False])
+@pytest.mark.parametrize("silu_activation", [True])
 @pytest.mark.parametrize("has_bias", [False])
 @pytest.mark.parametrize("seqlen", [1])
 @pytest.mark.parametrize("width", [4])
