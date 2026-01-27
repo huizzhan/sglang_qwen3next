@@ -13,6 +13,9 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
     causal_conv1d_update_persistent,
+    causal_conv1d_update_persistent_v2,
+    causal_conv1d_update_persistent_v1,
+    causal_conv1d_update_v2,
 )
 
 from sglang.srt.layers.attention.mamba.causal_conv1d_split_qkv import (
@@ -184,7 +187,7 @@ def causal_conv1d_opcheck_fn(
 # @pytest.mark.parametrize("batch", [1, 8, 64, 128, 256, 512, 1024])
 @pytest.mark.parametrize("batch", [128])
 # @pytest.mark.parametrize("total_entries", [256, 384, 640, 1280])
-@pytest.mark.parametrize("total_entries", [256])
+@pytest.mark.parametrize("total_entries", [128])
 
 def test_causal_conv1d_update(batch, dim, width, seqlen, has_bias, silu_activation, itype, total_entries):
     """
@@ -227,7 +230,7 @@ def test_causal_conv1d_update(batch, dim, width, seqlen, has_bias, silu_activati
     print(f"conv_state_indices.dtype: {conv_state_indices.dtype}")
     
     # Create larger conv_state tensor for continuous batching
-    conv_state_large = torch.randn(total_entries, width - 1, dim, device=device, dtype=itype).transpose(1, 2)
+    conv_state_large = torch.randn(total_entries, width - 1, dim, device=device, dtype=itype).transpose(1, 2).contiguous()
     conv_state_large_ref = conv_state_large.detach().clone()
     conv_state_large_gluon = conv_state_large.detach().clone()
     
@@ -271,7 +274,7 @@ def test_causal_conv1d_update(batch, dim, width, seqlen, has_bias, silu_activati
     try:
         conv_state_persistent_idx = conv_state_large.detach().clone()
         
-        out_persistent_idx = causal_conv1d_update_persistent(
+        out_persistent_idx = causal_conv1d_update_persistent_v1(
             x.clone(), conv_state_persistent_idx, weight, bias, 
             activation=activation, conv_state_indices=conv_state_indices
         )
@@ -327,7 +330,7 @@ def test_causal_conv1d_update(batch, dim, width, seqlen, has_bias, silu_activati
     if persistent_kernel_works:
         try:
             for _ in range(num_warmup):
-                _ = causal_conv1d_update_persistent(
+                _ = causal_conv1d_update_persistent_v1(
                     x.clone(), conv_state_persistent_idx.clone(), weight, bias, 
                     activation=activation, conv_state_indices=conv_state_indices
                 )
@@ -335,7 +338,7 @@ def test_causal_conv1d_update(batch, dim, width, seqlen, has_bias, silu_activati
             
             start_time = time.time()
             for _ in range(num_iters):
-                _ = causal_conv1d_update_persistent(
+                _ = causal_conv1d_update_persistent_v1(
                     x.clone(), conv_state_persistent_idx.clone(), weight, bias, 
                     activation=activation, conv_state_indices=conv_state_indices
                 )

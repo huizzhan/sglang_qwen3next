@@ -13,8 +13,8 @@ import triton.language as tl
 PAD_SLOT_ID = -1
 
 import os
-os.environ["TRITON_PRINT_AUTOTUNING"] = "1"  # 显示 autotune 过程和结果
-# os.environ["TRITON_CACHE_DIR"] = "/sgl-workspace/sglang/conv1d_gluon_cache_opt1"
+# os.environ["TRITON_PRINT_AUTOTUNING"] = "1"  # 显示 autotune 过程和结果
+# os.environ["TRITON_CACHE_DIR"] = "/sgl-workspace/sglang/conv1d_gluon_cache_persistent_v1"
 # os.environ["MLIR_ENABLE_DUMP"] = "1"
 # os.environ["AMDGCN_ENABLE_DUMP"] = "1"
 
@@ -1727,7 +1727,9 @@ def gluon_causal_conv1d_update_persistent_kernel_v1(
     BLOCK_N: gl.constexpr,
     SAVE_INTERMEDIATE: gl.constexpr,
 ):
-
+    # Note: Gluon does not support device_print, so parameter printing is done in Python wrapper
+    # See the wrapper function for parameter logging
+    
     blocked: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[2],
         threads_per_warp=[64],
@@ -1790,96 +1792,96 @@ def gluon_causal_conv1d_update_persistent_kernel_v1(
         #     conv_state_batch_coord = idx_seq
         
         # Check if this task should be processed
-        should_process = True
-        if USE_PAD_SLOT:  # noqa
-            if conv_state_batch_coord == pad_slot_id:
-                # not processing as this is not the actual sequence
-                should_process = False
+        # should_process = True
+        # if USE_PAD_SLOT:  # noqa
+        #     if conv_state_batch_coord == pad_slot_id:
+        #         # not processing as this is not the actual sequence
+        #         should_process = False
         
         # Only process if this is a valid task
-        if should_process:
-            conv_state_token_offset = 0
-            # STEP 1: READ init_state data
-            conv_states_base = (
-                conv_state_ptr
-                + (conv_state_batch_coord * stride_conv_state_seq)
-                + (idx_feats * stride_conv_state_dim)
+        # if should_process:
+        conv_state_token_offset = 0
+        # STEP 1: READ init_state data
+        conv_states_base = (
+            conv_state_ptr
+            + (conv_state_batch_coord * stride_conv_state_seq)
+            + (idx_feats * stride_conv_state_dim)
+        )
+        mask_w = idx_feats < dim
+
+        prior_tokens = conv_states_base + conv_state_token_offset * stride_conv_state_tok
+    # if KERNEL_WIDTH >= 2:
+        conv_states_ptrs = prior_tokens  # [BLOCK_N]
+        col0 = gl.load(conv_states_ptrs, mask_w, 0.0)
+        conv_state_vecs = (col0,)
+    # if KERNEL_WIDTH >= 3:
+        conv_states_ptrs = prior_tokens + 1 * stride_conv_state_tok  # [BLOCK_N]
+        col1 = gl.load(conv_states_ptrs, mask_w, 0.0)
+        conv_state_vecs = tuple_combine(conv_state_vecs, col1)
+    # if KERNEL_WIDTH >= 4:
+        conv_states_ptrs = prior_tokens + 2 * stride_conv_state_tok  # [BLOCK_N]
+        col2 = gl.load(conv_states_ptrs, mask_w, 0.0)
+        conv_state_vecs = tuple_combine(conv_state_vecs, col2)
+
+        conv_state_base = (
+            conv_state_ptr
+            + (conv_state_batch_coord * stride_conv_state_seq)
+            + (idx_feats * stride_conv_state_dim)
+        )  # [BLOCK_N,]
+        # conv_state_ptrs_target = (
+        #     conv_state_base + (idx_tokens * stride_conv_state_tok)[:, None]
+        # )  # [BLOCK_M, BLOCK_N]
+        # mask = (idx_tokens < state_len)[:, None] & (idx_feats2 < dim)[None, :]
+        # gl.store(conv_state_ptrs_target, new_conv_state, mask)
+
+        # STEP 3: init accumulator
+        if HAS_BIAS:
+            bias = bias_ptr + idx_feats
+            mask_bias = idx_feats < dim
+            acc_preload = gl.load(bias, mask=mask_bias, other=0.0).to(
+                o_ptr.type.element_ty
+            )  # [BLOCK_N]
+        else:
+            acc_preload = gl.zeros((BLOCK_N,), dtype=o_ptr.type.element_ty, layout=blocked)
+
+        x_base_1d = x_ptr + (idx_seq * stride_x_seq) + (idx_feats * stride_x_dim)  # starting of chunk [BLOCK_N]
+        mask_x_1d = idx_feats < dim
+
+        # STEP 5: compute each token
+        for idx_token in gl.static_range(seqlen):
+            acc = acc_preload
+
+            x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
+            x_vec = gl.load(x_ptrs_1d, mask=mask_x_1d)
+            conv_state_vecs = tuple_combine(conv_state_vecs, x_vec)
+            for j in gl.static_range(KERNEL_WIDTH):
+                matrix_w = w_vecs[j]
+                matrix_x = conv_state_vecs[j]
+
+                acc += matrix_x * matrix_w  # [BLOCK_N]
+
+            conv_state_vecs = conv_state_vecs[1:]
+
+            # if SILU_ACTIVATION:
+            # Convert to fp32 for exp calculation, then convert back
+            acc_fp32 = acc.to(gl.float32)
+            acc = acc_fp32 / (1 + gl.exp(-acc_fp32))
+            acc = acc.to(x_vec.dtype)
+
+            mask_1d = (idx_token < seqlen) & (
+                idx_feats < dim
+            )  # token-index  # feature-index
+            o_ptrs = (
+                o_ptr
+                + (idx_seq) * stride_o_seq
+                + idx_token * stride_o_token
+                + (idx_feats * stride_o_dim)
             )
-            mask_w = idx_feats < dim
 
-            prior_tokens = conv_states_base + conv_state_token_offset * stride_conv_state_tok
-        # if KERNEL_WIDTH >= 2:
-            conv_states_ptrs = prior_tokens  # [BLOCK_N]
-            col0 = gl.load(conv_states_ptrs, mask_w, 0.0)
-            conv_state_vecs = (col0,)
-        # if KERNEL_WIDTH >= 3:
-            conv_states_ptrs = prior_tokens + 1 * stride_conv_state_tok  # [BLOCK_N]
-            col1 = gl.load(conv_states_ptrs, mask_w, 0.0)
-            conv_state_vecs = tuple_combine(conv_state_vecs, col1)
-        # if KERNEL_WIDTH >= 4:
-            conv_states_ptrs = prior_tokens + 2 * stride_conv_state_tok  # [BLOCK_N]
-            col2 = gl.load(conv_states_ptrs, mask_w, 0.0)
-            conv_state_vecs = tuple_combine(conv_state_vecs, col2)
+            gl.store(o_ptrs, acc, mask=mask_1d)
 
-            conv_state_base = (
-                conv_state_ptr
-                + (conv_state_batch_coord * stride_conv_state_seq)
-                + (idx_feats * stride_conv_state_dim)
-            )  # [BLOCK_N,]
-            # conv_state_ptrs_target = (
-            #     conv_state_base + (idx_tokens * stride_conv_state_tok)[:, None]
-            # )  # [BLOCK_M, BLOCK_N]
-            # mask = (idx_tokens < state_len)[:, None] & (idx_feats2 < dim)[None, :]
-            # gl.store(conv_state_ptrs_target, new_conv_state, mask)
-
-            # STEP 3: init accumulator
-            if HAS_BIAS:
-                bias = bias_ptr + idx_feats
-                mask_bias = idx_feats < dim
-                acc_preload = gl.load(bias, mask=mask_bias, other=0.0).to(
-                    o_ptr.type.element_ty
-                )  # [BLOCK_N]
-            else:
-                acc_preload = gl.zeros((BLOCK_N,), dtype=o_ptr.type.element_ty, layout=blocked)
-
-            x_base_1d = x_ptr + (idx_seq * stride_x_seq) + (idx_feats * stride_x_dim)  # starting of chunk [BLOCK_N]
-            mask_x_1d = idx_feats < dim
-
-            # STEP 5: compute each token
-            for idx_token in gl.static_range(seqlen):
-                acc = acc_preload
-
-                x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                x_vec = gl.load(x_ptrs_1d, mask=mask_x_1d)
-                conv_state_vecs = tuple_combine(conv_state_vecs, x_vec)
-                for j in gl.static_range(KERNEL_WIDTH):
-                    matrix_w = w_vecs[j]
-                    matrix_x = conv_state_vecs[j]
-
-                    acc += matrix_x * matrix_w  # [BLOCK_N]
-
-                conv_state_vecs = conv_state_vecs[1:]
-
-                # if SILU_ACTIVATION:
-                # Convert to fp32 for exp calculation, then convert back
-                acc_fp32 = acc.to(gl.float32)
-                acc = acc_fp32 / (1 + gl.exp(-acc_fp32))
-                acc = acc.to(x_vec.dtype)
-
-                mask_1d = (idx_token < seqlen) & (
-                    idx_feats < dim
-                )  # token-index  # feature-index
-                o_ptrs = (
-                    o_ptr
-                    + (idx_seq) * stride_o_seq
-                    + idx_token * stride_o_token
-                    + (idx_feats * stride_o_dim)
-                )
-
-                gl.store(o_ptrs, acc, mask=mask_1d)
-
-            for l in gl.static_range(state_len):
-                gl.store(conv_state_base + l*stride_conv_state_tok, conv_state_vecs[l], idx_feats < dim)
+        for l in gl.static_range(state_len):
+            gl.store(conv_state_base + l*stride_conv_state_tok, conv_state_vecs[l], idx_feats < dim)
 
 @triton.autotune(
     configs=[
@@ -2744,6 +2746,132 @@ def causal_conv1d_update_persistent_v1(
         )
     else:
         stride_inter_seq = stride_inter_step = stride_inter_dim = stride_inter_win = 0
+
+    # Print all kernel parameters
+    print("=" * 80)
+    print("gluon_causal_conv1d_update_persistent_kernel_v1 Parameters:")
+    print("=" * 80)
+    
+    print("\n【输入张量详细信息】")
+    print("-" * 80)
+    
+    print(f"\n1. x (输入激活):")
+    print(f"   - shape: {x.shape} -> (batch={x.shape[0]}, dim={x.shape[1]}, seqlen={x.shape[2]})")
+    print(f"   - dtype: {x.dtype}")
+    print(f"   - stride: {x.stride()}")
+    print(f"   - is_contiguous: {x.is_contiguous()}")
+    print(f"   - data_ptr: {hex(x.data_ptr())}")
+    print(f"   - device: {x.device}")
+    
+    print(f"\n2. weight (卷积权重):")
+    print(f"   - shape: {weight.shape} -> (dim={weight.shape[0]}, width={weight.shape[1]})")
+    print(f"   - dtype: {weight.dtype}")
+    print(f"   - stride: {weight.stride()}")
+    print(f"   - is_contiguous: {weight.is_contiguous()}")
+    print(f"   - data_ptr: {hex(weight.data_ptr())}")
+    print(f"   - device: {weight.device}")
+    
+    if bias is not None:
+        print(f"\n3. bias (偏置):")
+        print(f"   - shape: {bias.shape} -> (dim={bias.shape[0]},)")
+        print(f"   - dtype: {bias.dtype}")
+        print(f"   - stride: {bias.stride()}")
+        print(f"   - is_contiguous: {bias.is_contiguous()}")
+        print(f"   - data_ptr: {hex(bias.data_ptr())}")
+        print(f"   - device: {bias.device}")
+    else:
+        print(f"\n3. bias: None")
+    
+    print(f"\n4. conv_state (卷积状态缓存):")
+    print(f"   - shape: {conv_state.shape} -> (num_cache_lines={conv_state.shape[0]}, dim={conv_state.shape[1]}, state_len={conv_state.shape[2]})")
+    print(f"   - dtype: {conv_state.dtype}")
+    print(f"   - stride: {conv_state.stride()}")
+    print(f"   - is_contiguous: {conv_state.is_contiguous()}")
+    print(f"   - data_ptr: {hex(conv_state.data_ptr())}")
+    print(f"   - device: {conv_state.device}")
+    
+    if conv_state_indices is not None:
+        print(f"\n5. conv_state_indices (批次索引映射):")
+        print(f"   - shape: {conv_state_indices.shape} -> (batch={conv_state_indices.shape[0]},)")
+        print(f"   - dtype: {conv_state_indices.dtype}")
+        print(f"   - stride: {conv_state_indices.stride()}")
+        print(f"   - is_contiguous: {conv_state_indices.is_contiguous()}")
+        print(f"   - data_ptr: {hex(conv_state_indices.data_ptr())}")
+        print(f"   - device: {conv_state_indices.device}")
+        print(f"   - values (前10个): {conv_state_indices[:min(10, len(conv_state_indices))].tolist()}")
+        print(f"   - min/max: {conv_state_indices.min().item()}/{conv_state_indices.max().item()}")
+    else:
+        print(f"\n5. conv_state_indices: None")
+    
+    print(f"\n6. out (输出):")
+    print(f"   - shape: {out.shape} -> (batch={out.shape[0]}, dim={out.shape[1]}, seqlen={out.shape[2]})")
+    print(f"   - dtype: {out.dtype}")
+    print(f"   - stride: {out.stride()}")
+    print(f"   - is_contiguous: {out.is_contiguous()}")
+    print(f"   - data_ptr: {hex(out.data_ptr())}")
+    print(f"   - device: {out.device}")
+    print(f"   - shares storage with x: {out.data_ptr() == x.data_ptr()}")
+    
+    print("\n【矩阵维度】")
+    print("-" * 80)
+    print(f"  batch:           {batch:6d}  (批次大小)")
+    print(f"  dim:             {dim:6d}  (特征维度/通道数)")
+    print(f"  seqlen:          {seqlen:6d}  (序列长度)")
+    print(f"  width:           {width:6d}  (卷积核宽度)")
+    print(f"  state_len:       {state_len:6d}  (状态长度)")
+    print(f"  num_cache_lines: {num_cache_lines:6d}  (缓存行数)")
+    print(f"  np2_statelen:    {np2_statelen:6d}  (2的幂次状态长度)")
+    
+    print("\n【步幅信息】")
+    print("-" * 80)
+    print(f"  x 张量步幅:")
+    print(f"    stride_x_seq:   {stride_x_seq:8d}  (批次间步幅)")
+    print(f"    stride_x_dim:   {stride_x_dim:8d}  (特征间步幅)")
+    print(f"    stride_x_token: {stride_x_token:8d}  (token间步幅)")
+    
+    print(f"\n  weight 张量步幅:")
+    print(f"    stride_w_dim:   {stride_w_dim:8d}  (特征间步幅)")
+    print(f"    stride_w_width: {stride_w_width:8d}  (卷积宽度步幅)")
+    
+    print(f"\n  conv_state 张量步幅:")
+    print(f"    stride_conv_state_seq: {stride_istate_seq:8d}  (序列/缓存行间步幅)")
+    print(f"    stride_conv_state_dim: {stride_istate_dim:8d}  (特征间步幅)")
+    print(f"    stride_conv_state_tok: {stride_istate_token:8d}  (token间步幅)")
+    print(f"    stride_state_indices:  {stride_state_indices:8d}  (索引步幅)")
+    
+    print(f"\n  output 张量步幅:")
+    print(f"    stride_o_seq:   {stride_o_seq:8d}  (批次间步幅)")
+    print(f"    stride_o_dim:   {stride_o_dim:8d}  (特征间步幅)")
+    print(f"    stride_o_token: {stride_o_token:8d}  (token间步幅)")
+    
+    if intermediate_conv_window is not None:
+        print(f"\n  intermediate 张量步幅:")
+        print(f"    stride_inter_seq:  {stride_inter_seq:8d}")
+        print(f"    stride_inter_step: {stride_inter_step:8d}")
+        print(f"    stride_inter_dim:  {stride_inter_dim:8d}")
+        print(f"    stride_inter_win:  {stride_inter_win:8d}")
+    
+    print("\n【配置参数】")
+    print("-" * 80)
+    print(f"  pad_slot_id:           {pad_slot_id}")
+    print(f"  HAS_BIAS:              {bias is not None}")
+    print(f"  KERNEL_WIDTH:          {width}")
+    print(f"  SILU_ACTIVATION:       {activation in ['silu', 'swish']} (activation={activation})")
+    print(f"  IS_CONTINUOUS_BATCHING: {conv_state_indices is not None}")
+    print(f"  IS_SPEC_DECODING:      {num_accepted_tokens is not None}")
+    print(f"  USE_PAD_SLOT:          {pad_slot_id is not None}")
+    print(f"  BLOCK_N:               1024")
+    print(f"  SAVE_INTERMEDIATE:     {intermediate_conv_window is not None}")
+    print(f"  num_warps:             8")
+    
+    print("\n【内核启动配置】")
+    print("-" * 80)
+    print(f"  grid:           {grid}")
+    print(f"  预期CU数:       80")
+    print(f"  dim_blocks:     {(dim + 1023) // 1024}")
+    print(f"  total_tasks:    {batch * ((dim + 1023) // 1024)}")
+    print("=" * 80)
+    print()
 
     gluon_causal_conv1d_update_persistent_kernel_v1[grid](
         # Pointers to matrices
