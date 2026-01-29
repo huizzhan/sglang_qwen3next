@@ -1143,7 +1143,7 @@ def gluon_causal_conv1d_update_kernel(
         # 建议：先单独测试每个配置确保正确性，然后再启用多个配置
         # triton.Config({'BLOCK_N': 2048}, num_warps=16, num_stages=1),
         # triton.Config({'BLOCK_N': 1024}, num_warps=8, num_stages=1),
-        triton.Config({'BLOCK_N': 512}, num_warps=4, num_stages=1),
+        # triton.Config({'BLOCK_N': 512}, num_warps=4, num_stages=1),
         triton.Config({'BLOCK_N': 256}, num_warps=2, num_stages=1),
         # triton.Config({'BLOCK_N': 1024}, num_warps=16, num_stages=1),
         # triton.Config({'BLOCK_N': 512}, num_warps=8, num_stages=1),
@@ -2491,6 +2491,154 @@ def gluon_causal_conv1d_update_persistent_kernel_v3(
                 mask=mask_feat
             )
 
+@gluon.jit()
+def gluon_causal_conv1d_update_persistent_kernel_v4(
+    # Pointers to matrices
+    x_ptr,  # (batch, dim, seqlen)
+    w_ptr,  # (dim, width)
+    bias_ptr,
+    conv_state_ptr,
+    cache_seqlens_ptr,  # circular buffer
+    conv_state_indices_ptr,
+    num_accepted_tokens_ptr,
+    intermediate_conv_window_ptr,
+    o_ptr,  # (batch, dim, seqlen)
+    # Matrix dimensions
+    batch: int,
+    dim: gl.constexpr,
+    seqlen: gl.constexpr,
+    state_len: gl.constexpr,
+    num_cache_lines: gl.constexpr,  # added to support vLLM larger cache lines
+    # Strides
+    stride_x_seq: gl.constexpr,
+    stride_x_dim: gl.constexpr,
+    stride_x_token: gl.constexpr,
+    stride_w_dim: gl.constexpr,
+    stride_w_width: gl.constexpr,
+    stride_conv_state_seq: gl.constexpr,
+    stride_conv_state_dim: gl.constexpr,
+    stride_conv_state_tok: gl.constexpr,
+    stride_state_indices: gl.constexpr,
+    stride_inter_seq: gl.constexpr,
+    stride_inter_step: gl.constexpr,
+    stride_inter_dim: gl.constexpr,
+    stride_inter_win: gl.constexpr,
+    stride_o_seq: gl.constexpr,
+    stride_o_dim: gl.constexpr,
+    stride_o_token: gl.constexpr,
+    # others
+    pad_slot_id: gl.constexpr,
+    # Meta-parameters
+    HAS_BIAS: gl.constexpr,
+    KERNEL_WIDTH: gl.constexpr,
+    SILU_ACTIVATION: gl.constexpr,
+    IS_CONTINUOUS_BATCHING: gl.constexpr,
+    IS_SPEC_DECODING: gl.constexpr,
+    NP2_STATELEN: gl.constexpr,
+    USE_PAD_SLOT: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    SAVE_INTERMEDIATE: gl.constexpr,
+):
+    # Note: Gluon does not support device_print, so parameter printing is done in Python wrapper
+    # See the wrapper function for parameter logging
+    
+    blocked: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[2],
+        threads_per_warp=[64],
+        warps_per_cta=[8],
+        order=[0],
+    )
+
+    cu_idx = gl.program_id(0)  # Current CU ID (0-79)
+    num_cus = 80                # Fixed number of CUs
+    
+    # Calculate total number of tasks
+    num_dim_blocks = gl.cdiv(dim, BLOCK_N)  # Number of blocks needed in dim direction
+    total_tasks = batch * num_dim_blocks     # Total number of tasks
+    
+    # New mapping: each CU processes tasks from the same dim_block across different batches
+    # Determine dim_block_idx directly from cu_idx
+    cus_per_dim_block = gl.cdiv(num_cus, num_dim_blocks)  # How many CUs allocated per dim_block
+    dim_block_idx = cu_idx // cus_per_dim_block  # Which dim_block this CU handles
+    cu_idx_in_dim_block = cu_idx % cus_per_dim_block  # Index of this CU within the dim_block group
+    
+    # Calculate number of batch tasks per CU for this dim_block
+    per_cu_batches = batch // cus_per_dim_block  # Base number of batches per CU
+    cu_mores = batch % cus_per_dim_block  # Remaining batches
+    
+    # First cu_mores CUs (within this dim_block group) handle 1 additional batch
+    cu_num_tasks = (per_cu_batches + 1) if cu_idx_in_dim_block < cu_mores else per_cu_batches
+    cu_task_offset = cu_idx_in_dim_block * (per_cu_batches + 1) if cu_idx_in_dim_block < cu_mores else (cu_mores * (per_cu_batches + 1) + (cu_idx_in_dim_block - cu_mores) * per_cu_batches)
+
+    # idx_feats is constant for all tasks in this CU (same dim_block_idx)
+    idx_feats = dim_block_idx * BLOCK_N + gl.arange(0, BLOCK_N, layout=blocked)
+
+    # STEP 1:
+    # PRE-LOAD WEIGHTS
+    # first kernel column, configured for weights to handle BLOCK_N features in range
+    w_base = w_ptr + (idx_feats * stride_w_dim)  # [BLOCK_N,]
+    mask = idx_feats < dim
+
+    w_ptrs = w_base + (0 * stride_w_width)  # [BLOCK_N] tensor
+    w_col0 = gl.load(w_ptrs, mask, other=0.0)
+
+    w_ptrs = w_base + (1 * stride_w_width)  # [BLOCK_N] tensor
+    w_col1 = gl.load(w_ptrs, mask, other=0.0)
+
+    w_ptrs = w_base + (2 * stride_w_width)  # [BLOCK_N] tensor
+    w_col2 = gl.load(w_ptrs, mask, other=0.0)
+
+    w_ptrs = w_base + (3 * stride_w_width)  # [BLOCK_N] tensor
+    w_col3 = gl.load(w_ptrs, mask, other=0.0)
+
+    for task_idx in range(cu_num_tasks):
+        # All tasks in this CU belong to the same dim_block_idx but different batches
+        idx_seq = cu_task_offset + task_idx  # Batch index
+
+        conv_state_batch_coord = gl.load(
+            conv_state_indices_ptr + idx_seq * stride_state_indices
+        ).to(gl.int64)
+
+        # STEP 2: READ conv_states data
+        conv_states_base = (
+            conv_state_ptr
+            + (conv_state_batch_coord * stride_conv_state_seq)
+            + (idx_feats * stride_conv_state_dim)
+        )
+        mask = idx_feats < dim
+
+        conv_states_ptrs = conv_states_base  # [BLOCK_N]
+        col0 = gl.load(conv_states_ptrs, mask, 0.0)
+        # STEP 3: init accumulator
+        acc = gl.zeros((BLOCK_N,), dtype=o_ptr.type.element_ty, layout=blocked)
+        acc += w_col0 * col0  # [BLOCK_N]
+
+        conv_states_ptrs = conv_states_base + 1 * stride_conv_state_tok  # [BLOCK_N]
+        col1 = gl.load(conv_states_ptrs, mask, 0.0)
+        acc += w_col1 * col1  # [BLOCK_N]
+
+        conv_states_ptrs = conv_states_base + 2 * stride_conv_state_tok  # [BLOCK_N]
+        col2 = gl.load(conv_states_ptrs, mask, 0.0)
+        acc += w_col2 * col2  # [BLOCK_N]
+
+        x_base_1d = x_ptr + (idx_seq * stride_x_seq) + (idx_feats * stride_x_dim)  # starting of chunk [BLOCK_N]
+        x_ptrs_1d = x_base_1d
+        x_vec = gl.load(x_ptrs_1d, mask)
+        acc += w_col3 * x_vec  # [BLOCK_N]
+
+        # if SILU_ACTIVATION, Convert to fp32 for exp calculation, then convert back
+        acc_fp32 = acc.to(gl.float32)
+        acc = acc_fp32 / (1 + gl.exp(-acc_fp32))
+        acc = acc.to(x_vec.dtype)
+
+        o_ptrs = o_ptr + idx_seq * stride_o_seq + idx_feats * stride_o_dim
+        gl.store(o_ptrs, acc, mask)
+
+        gl.store(conv_states_base, col1, mask)
+        gl.store(conv_states_base + stride_conv_state_tok, col2, mask)
+        gl.store(conv_states_base + 2 * stride_conv_state_tok, x_vec, mask)
+        
+
 def causal_conv1d_update(
     x: torch.Tensor,
     conv_state: torch.Tensor,
@@ -3701,6 +3849,160 @@ def causal_conv1d_update_persistent_v3(
         BLOCK_N=2048,
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
         num_warps=16
+    )
+    if unsqueeze:
+        out = out.squeeze(-1)
+    return out
+
+def causal_conv1d_update_persistent_v4(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    activation: Union[bool, str, None] = None,
+    cache_seqlens: Optional[torch.Tensor] = None,
+    conv_state_indices: Optional[torch.Tensor] = None,
+    num_accepted_tokens: Optional[torch.Tensor] = None,
+    intermediate_conv_window: Optional[torch.Tensor] = None,
+    pad_slot_id: int = PAD_SLOT_ID,
+    metadata=None,
+    validate_data=False,
+):
+    """
+    x: (batch, dim) or (batch, dim, seqlen)
+        [shape=2: single token prediction]
+        [shape=3: single or multiple tokens prediction]
+    conv_state: (..., dim, state_len), where state_len >= width - 1
+    weight: (dim, width)
+    bias: (dim,)
+    cache_seqlens: (batch,), dtype int32.
+        If not None, the conv_state is treated as a circular buffer.
+        The conv_state will be updated by copying x to the conv_state
+        starting at the index
+        @cache_seqlens % state_len.
+    conv_state_indices: (batch,), dtype int32
+        If not None, the conv_state is a larger tensor along the batch dim,
+        and we are selecting the batch coords specified by conv_state_indices.
+        Useful for a continuous batching scenario.
+    pad_slot_id: int
+            if cache_indices is passed, lets the kernel identify padded
+            entries that will not be processed,
+            for example: cache_indices = [pad_slot_id, 1 ,20 ,pad_slot_id]
+            in this case, the kernel will not process entries at
+            indices 0 and 3
+    out: (batch, dim) or (batch, dim, seqlen)
+    """
+    if validate_data:
+        assert cache_seqlens is None  # not implemented yet - ok for vLLM
+        assert pad_slot_id is not None
+        assert x.stride(1) == 1
+    if isinstance(activation, bool):
+        activation = "silu" if activation is True else None
+    elif activation is not None:
+        assert activation in ["silu", "swish"]
+    unsqueeze = x.dim() == 2
+    if unsqueeze:
+        # make it (batch, dim, seqlen) with seqlen == 1
+        x = x.unsqueeze(-1)
+    batch, dim, seqlen = x.shape
+    _, width = weight.shape
+    # conv_state: (..., dim, state_len), where state_len >= width - 1
+    num_cache_lines, _, state_len = conv_state.size()
+
+    if validate_data:
+        assert dim == weight.size(0)
+        assert (
+            conv_state.stride(-2) == 1
+        ), f"ERROR: expect contiguous along feat-dim of conv_state (currently stride={conv_state.stride()})"
+        assert state_len >= width - 1
+        # when above happens, we don't shift-left to keep any records in conv_state
+        assert dim == conv_state.size(1)
+        if conv_state_indices is None:
+            assert conv_state.size(0) >= batch
+        else:
+            assert (batch,) == conv_state_indices.shape
+
+        assert num_cache_lines >= batch
+        assert weight.stride(1) == 1  # Need this
+        assert cache_seqlens is None  # not needed for vLLM - circular buffer
+
+    # adopt the strategy in vLLM that overwrite on 'x' directly, rather than creating a new tensor 'o'
+    out = x
+    stride_w_dim, stride_w_width = weight.stride()
+
+    stride_x_seq, stride_x_dim, stride_x_token = x.stride()  # X (batch, dim, seqlen)
+
+    stride_o_seq, stride_o_dim, stride_o_token = out.stride()
+    stride_istate_seq, stride_istate_dim, stride_istate_token = conv_state.stride()
+    stride_state_indices = (
+        conv_state_indices.stride(0) if conv_state_indices is not None else 0
+    )
+    if num_accepted_tokens is not None:
+        state_len = width - 1 + (seqlen - 1)  # effective state_len needed
+    else:
+        state_len = width - 1
+    np2_statelen = triton.next_power_of_2(state_len)
+
+    grid = (80,)
+
+    # prepare intermediate buffer strides if provided
+    if intermediate_conv_window is not None:
+        stride_inter_seq, stride_inter_step, stride_inter_dim, stride_inter_win = (
+            intermediate_conv_window.stride(0),
+            intermediate_conv_window.stride(1),
+            intermediate_conv_window.stride(2),
+            intermediate_conv_window.stride(3),
+        )
+    else:
+        stride_inter_seq = stride_inter_step = stride_inter_dim = stride_inter_win = 0
+
+    gluon_causal_conv1d_update_persistent_kernel_v4[grid](
+        # Pointers to matrices
+        x,
+        weight,
+        bias,
+        conv_state,
+        cache_seqlens,
+        conv_state_indices,
+        num_accepted_tokens,
+        intermediate_conv_window if intermediate_conv_window is not None else x,
+        out,
+        # Matrix dimensions
+        batch,
+        dim,
+        seqlen,
+        state_len,
+        num_cache_lines,
+        # stride
+        stride_x_seq,
+        stride_x_dim,
+        stride_x_token,
+        stride_w_dim,
+        stride_w_width,
+        stride_istate_seq,
+        stride_istate_dim,
+        stride_istate_token,
+        stride_state_indices,
+        stride_inter_seq,
+        stride_inter_step,
+        stride_inter_dim,
+        stride_inter_win,
+        stride_o_seq,
+        stride_o_dim,
+        stride_o_token,
+        # others
+        pad_slot_id,
+        # META
+        HAS_BIAS=bias is not None,
+        KERNEL_WIDTH=width,
+        SILU_ACTIVATION=activation in ["silu", "swish"],
+        IS_CONTINUOUS_BATCHING=conv_state_indices is not None,
+        IS_SPEC_DECODING=num_accepted_tokens is not None,
+        NP2_STATELEN=np2_statelen,
+        USE_PAD_SLOT=pad_slot_id is not None,
+        BLOCK_N=1024,
+        SAVE_INTERMEDIATE=intermediate_conv_window is not None,
+        num_warps=8
     )
     if unsqueeze:
         out = out.squeeze(-1)
