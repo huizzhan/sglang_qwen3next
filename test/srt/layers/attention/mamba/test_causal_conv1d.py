@@ -209,7 +209,7 @@ def test_causal_conv1d_update(batch, dim, width, seqlen, has_bias, silu_activati
     x = torch.randn(batch, dim, seqlen, device=device, dtype=itype)
     x_ref = x.clone()
 
-    weight = torch.randn(dim, width, device=device, dtype=itype)
+    weight = torch.randn(width, dim, device=device, dtype=itype).contiguous().transpose(1, 0)
     bias = torch.randn(dim, device=device, dtype=itype) if has_bias else None
     activation = None if not silu_activation else "silu"
     
@@ -230,7 +230,7 @@ def test_causal_conv1d_update(batch, dim, width, seqlen, has_bias, silu_activati
     print(f"conv_state_indices.dtype: {conv_state_indices.dtype}")
     
     # Create larger conv_state tensor for continuous batching
-    conv_state_large = torch.randn(total_entries, width - 1, dim, device=device, dtype=itype).transpose(1, 2).contiguous()
+    conv_state_large = torch.randn(total_entries, width - 1, dim, device=device, dtype=itype).contiguous().transpose(1, 2)
     conv_state_large_ref = conv_state_large.detach().clone()
     conv_state_large_gluon = conv_state_large.detach().clone()
     

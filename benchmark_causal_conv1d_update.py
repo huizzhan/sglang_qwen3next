@@ -15,6 +15,7 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_update_persistent,
     causal_conv1d_update_persistent_v1,
     causal_conv1d_update_persistent_v2,
+    causal_conv1d_update_persistent_v3,
 )
 
 # ============================================================================
@@ -40,11 +41,11 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
 
 KERNELS_TO_TEST = [
     (causal_conv1d_update, "Gluon Kernel"),
-    # (causal_conv1d_update_persistent_v2, "Persistent v2"),
-    # (causal_conv1d_update_persistent, "Persistent Kernel"),
+    (causal_conv1d_update_persistent_v2, "Persistent v2"),
+    (causal_conv1d_update_persistent, "Persistent Kernel"),
     (causal_conv1d_update_persistent_v1, "Persistent v1"),
-    # (causal_conv1d_update_persistent_v2, "Persistent v2"),
-    (causal_conv1d_update_v2, "V2 Kernel"),
+    (causal_conv1d_update_persistent_v3, "Persistent v3"),
+    (causal_conv1d_update_v2, "Gluon V2 Kernel"),
     # 添加更多 kernel（取消注释以启用）:
     # (causal_conv1d_update, "Gluon (Duplicate Test)"),  # 测试重复添加
     # (your_new_kernel_func, "Your Custom Kernel Name"),
@@ -308,7 +309,7 @@ def benchmark_causal_conv1d_update(
     x = torch.randn(batch, dim, seqlen, device=device, dtype=itype)
     x_ref = x.clone()
     
-    weight = torch.randn(dim, width, device=device, dtype=itype)
+    weight = torch.randn(width, dim, device=device, dtype=itype).contiguous().transpose(0, 1)
     bias = torch.randn(dim, device=device, dtype=itype) if has_bias else None
     activation = None if not silu_activation else "silu"
     
@@ -324,7 +325,7 @@ def benchmark_causal_conv1d_update(
     print(f"conv_state_indices.dtype: {conv_state_indices.dtype}")
     
     # 创建更大的 conv_state 张量用于连续批处理
-    conv_state_large = torch.randn(total_entries, width - 1, dim, device=device, dtype=itype).transpose(1, 2).contiguous()
+    conv_state_large = torch.randn(total_entries, width - 1, dim, device=device, dtype=itype).contiguous().transpose(1, 2)
     conv_state_large_ref = conv_state_large.detach().clone()
     
     # 运行参考实现（使用 conv_state_indices）
