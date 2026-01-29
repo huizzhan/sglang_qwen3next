@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     PAD_SLOT_ID,
     causal_conv1d_update,
+    causal_conv1d_update_v1,
     causal_conv1d_update_v2,
     causal_conv1d_update_persistent,
     causal_conv1d_update_persistent_v1,
@@ -40,12 +41,13 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
 # ============================================================================
 
 KERNELS_TO_TEST = [
-    (causal_conv1d_update, "Gluon Kernel"),
-    (causal_conv1d_update_persistent_v2, "Persistent v2"),
-    (causal_conv1d_update_persistent, "Persistent Kernel"),
-    (causal_conv1d_update_persistent_v1, "Persistent v1"),
-    (causal_conv1d_update_persistent_v3, "Persistent v3"),
-    (causal_conv1d_update_v2, "Gluon V2 Kernel"),
+    # (causal_conv1d_update, "Gluon Kernel"),
+    # (causal_conv1d_update_persistent_v2, "Persistent v2"),
+    # (causal_conv1d_update_persistent, "Persistent Kernel"),
+    # (causal_conv1d_update_persistent_v1, "Persistent v1"),
+    # (causal_conv1d_update_persistent_v3, "Persistent v3"),
+    (causal_conv1d_update_v1, "Gluon V1 Kernel"),
+    # (causal_conv1d_update_v2, "Gluon V2 Kernel"),
     # 添加更多 kernel（取消注释以启用）:
     # (causal_conv1d_update, "Gluon (Duplicate Test)"),  # 测试重复添加
     # (your_new_kernel_func, "Your Custom Kernel Name"),
