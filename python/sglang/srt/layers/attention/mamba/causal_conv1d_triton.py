@@ -3204,12 +3204,6 @@ def gluon_causal_conv1d_update_persistent_kernel_v7(
     # Load conv_state_batch_coord for task 0
     conv_state_batch_coord_ptr = (conv_state_indices_ptr + idx_seq * stride_state_indices)
     conv_state_batch_coord = gl.load(conv_state_batch_coord_ptr).to(gl.int64)
-    
-    # Pre-load conv_state_batch_coord for task 1 (2-level prefetch)
-    idx_seq_next = idx_seq + 1
-    conv_state_batch_coord_ptr_next = (conv_state_indices_ptr + idx_seq_next * stride_state_indices)
-    conv_state_batch_coord_next = gl.load(conv_state_batch_coord_ptr_next).to(gl.int64)
-    
     # Load col0, col1, col2, x for task 0 (1-level prefetch)
     conv_states_base = (
         conv_state_ptr
@@ -3229,9 +3223,9 @@ def gluon_causal_conv1d_update_persistent_kernel_v7(
     # Main loop with 2-level prefetch for conv_state_batch_coord, 1-level for data
     for task_idx in range(cu_num_tasks - 1):
         # Pre-load conv_state_batch_coord for task i+2 (2 iterations ahead)
-        idx_seq_next_next = idx_seq + 2
-        conv_state_batch_coord_ptr_next_next = (conv_state_indices_ptr + idx_seq_next_next * stride_state_indices)
-        conv_state_batch_coord_next_next = gl.load(conv_state_batch_coord_ptr_next_next).to(gl.int64)
+        idx_seq_next = idx_seq + 1
+        conv_state_batch_coord_ptr_next = (conv_state_indices_ptr + idx_seq_next * stride_state_indices)
+        conv_state_batch_coord_next = gl.load(conv_state_batch_coord_ptr_next).to(gl.int64)
         
         # Pre-load col0, col1, col2, x for task i+1 (1 iteration ahead) using already-loaded conv_state_batch_coord_next
         conv_states_base_next = (
@@ -3280,9 +3274,6 @@ def gluon_causal_conv1d_update_persistent_kernel_v7(
         col1 = col1_next
         col2 = col2_next
         x_vec = x_vec_next
-        
-        idx_seq_next = idx_seq_next_next
-        conv_state_batch_coord_next = conv_state_batch_coord_next_next
 
     # Epilogue: Process the last task
     acc = gl.zeros((BLOCK_N,), dtype=o_ptr.type.element_ty, layout=blocked)
@@ -3409,83 +3400,91 @@ def gluon_causal_conv1d_update_persistent_kernel_v7_opt1(
     w_ptrs = w_base + (3 * stride_w_width)  # [BLOCK_N] tensor
     w_col3 = gl.load(w_ptrs, mask, other=0.0)
     
-    # Prologue: Pre-load conv_state_batch_coord for first TWO iterations (2-level prefetch for batch coord only)
+    # Prologue: Pre-load data for first TWO tasks (2-level prefetch)
     idx_seq = cu_task_offset
     
-    # Load conv_state_batch_coord for task 0
+    # Early exit for empty tasks
+    if cu_num_tasks == 0:
+        return
+    
+    # Load task 0 data
     conv_state_batch_coord_ptr = (conv_state_indices_ptr + idx_seq * stride_state_indices)
     conv_state_batch_coord = gl.load(conv_state_batch_coord_ptr).to(gl.int64)
-    
-    # Pre-load conv_state_batch_coord for task 1 (2-level prefetch)
-    idx_seq_next = idx_seq + 1
-    conv_state_batch_coord_ptr_next = (conv_state_indices_ptr + idx_seq_next * stride_state_indices)
-    conv_state_batch_coord_next = gl.load(conv_state_batch_coord_ptr_next).to(gl.int64)
-    
-    # Load col0, col1, col2, x for task 0 (1-level prefetch)
     conv_states_base = (
         conv_state_ptr
         + (conv_state_batch_coord * stride_conv_state_seq)
         + (idx_feats * stride_conv_state_dim)
     )
-    conv_states_ptrs0 = conv_states_base
-    col0 = gl.load(conv_states_ptrs0, mask, 0.0)
-    conv_states_ptrs1 = conv_states_base + stride_conv_state_tok
-    col1 = gl.load(conv_states_ptrs1, mask, 0.0)
-    conv_states_ptrs2 = conv_states_base + 2*stride_conv_state_tok
-    col2 = gl.load(conv_states_ptrs2, mask, 0.0)
-    
+    col0 = gl.load(conv_states_base, mask, 0.0)
+    col1 = gl.load(conv_states_base + stride_conv_state_tok, mask, 0.0)
+    col2 = gl.load(conv_states_base + 2*stride_conv_state_tok, mask, 0.0)
     x_ptrs_1d = x_ptr + (idx_seq * stride_x_seq) + (idx_feats * stride_x_dim)
     x_vec = gl.load(x_ptrs_1d, mask)
-
-    # Main loop with 2-level prefetch for conv_state_batch_coord, 1-level for data
-    for task_idx in range(cu_num_tasks - 1):
-        # Pre-load conv_state_batch_coord for task i+2 (2 iterations ahead)
-        idx_seq_next_next = idx_seq + 2
-        conv_state_batch_coord_ptr_next_next = (conv_state_indices_ptr + idx_seq_next_next * stride_state_indices)
-        conv_state_batch_coord_next_next = gl.load(conv_state_batch_coord_ptr_next_next).to(gl.int64)
-        
-        # Pre-load col0, col1, col2, x for task i+1 (1 iteration ahead) using already-loaded conv_state_batch_coord_next
+    
+    # Initialize next task variables (will be overwritten if cu_num_tasks > 1)
+    idx_seq_next = idx_seq
+    conv_state_batch_coord_next = conv_state_batch_coord
+    conv_states_base_next = conv_states_base
+    col0_next = col0
+    col1_next = col1
+    col2_next = col2
+    x_vec_next = x_vec
+    
+    # Pre-load task 1 data if available
+    if cu_num_tasks > 1:
+        idx_seq_next = idx_seq + 1
+        conv_state_batch_coord_ptr_next = (conv_state_indices_ptr + idx_seq_next * stride_state_indices)
+        conv_state_batch_coord_next = gl.load(conv_state_batch_coord_ptr_next).to(gl.int64)
         conv_states_base_next = (
             conv_state_ptr
             + (conv_state_batch_coord_next * stride_conv_state_seq)
             + (idx_feats * stride_conv_state_dim)
         )
-        
-        conv_states_ptrs_next0 = conv_states_base_next
-        col0_next = gl.load(conv_states_ptrs_next0, mask, 0.0)
-        conv_states_ptrs_next1 = conv_states_base_next + stride_conv_state_tok
-        col1_next = gl.load(conv_states_ptrs_next1, mask, 0.0)
-        conv_states_ptrs_next2 = conv_states_base_next + 2*stride_conv_state_tok
-        col2_next = gl.load(conv_states_ptrs_next2, mask, 0.0)
-
+        col0_next = gl.load(conv_states_base_next, mask, 0.0)
+        col1_next = gl.load(conv_states_base_next + stride_conv_state_tok, mask, 0.0)
+        col2_next = gl.load(conv_states_base_next + 2*stride_conv_state_tok, mask, 0.0)
         x_ptrs_1d_next = x_ptr + (idx_seq_next * stride_x_seq) + (idx_feats * stride_x_dim)
         x_vec_next = gl.load(x_ptrs_1d_next, mask)
+
+    # Main loop with 2-level prefetch
+    for task_idx in range(cu_num_tasks - 2):
+        # Pre-load data for task i+2 (2 iterations ahead)
+        idx_seq_next2 = idx_seq + 2
+        conv_state_batch_coord_ptr_next2 = (conv_state_indices_ptr + idx_seq_next2 * stride_state_indices)
+        conv_state_batch_coord_next2 = gl.load(conv_state_batch_coord_ptr_next2).to(gl.int64)
+        conv_states_base_next2 = (
+            conv_state_ptr
+            + (conv_state_batch_coord_next2 * stride_conv_state_seq)
+            + (idx_feats * stride_conv_state_dim)
+        )
+        col0_next2 = gl.load(conv_states_base_next2, mask, 0.0)
+        col1_next2 = gl.load(conv_states_base_next2 + stride_conv_state_tok, mask, 0.0)
+        col2_next2 = gl.load(conv_states_base_next2 + 2*stride_conv_state_tok, mask, 0.0)
+        x_ptrs_1d_next2 = x_ptr + (idx_seq_next2 * stride_x_seq) + (idx_feats * stride_x_dim)
+        x_vec_next2 = gl.load(x_ptrs_1d_next2, mask)
         
-        # Compute current task
-        acc0 = gl.zeros((BLOCK_N,), dtype=o_ptr.type.element_ty, layout=blocked)
-        acc0 += w_col0 * col0
-        acc0 += w_col1 * col1
-        acc1 = gl.zeros((BLOCK_N,), dtype=o_ptr.type.element_ty, layout=blocked)
-        acc1 += w_col2 * col2
-        acc1 += w_col3 * x_vec
-        acc = acc0 + acc1
+        # Compute current task (task i)
+        acc = gl.zeros((BLOCK_N,), dtype=o_ptr.type.element_ty, layout=blocked)
+        acc += w_col0 * col0
+        acc += w_col1 * col1
+        acc += w_col2 * col2
+        acc += w_col3 * x_vec
 
         # SILU activation
         acc_fp32 = acc.to(gl.float32)
         acc = acc_fp32 / (1 + gl.exp(-acc_fp32))
         acc = acc.to(x_vec.dtype)
 
+        # Store output for task i
         o_ptrs = o_ptr + idx_seq * stride_o_seq + idx_feats * stride_o_dim
         gl.store(o_ptrs, acc, mask)
         
-        conv_states_ptrs0 = conv_states_base
-        gl.store(conv_states_ptrs0, col1, mask)
-        conv_states_ptrs1 = conv_states_base + stride_conv_state_tok
-        gl.store(conv_states_ptrs1, col2, mask)
-        conv_states_ptrs2 = conv_states_base + 2*stride_conv_state_tok
-        gl.store(conv_states_ptrs2, x_vec, mask)
+        # Write back updated conv state for task i
+        gl.store(conv_states_base, col1, mask)
+        gl.store(conv_states_base + stride_conv_state_tok, col2, mask)
+        gl.store(conv_states_base + 2*stride_conv_state_tok, x_vec, mask)
         
-        # Roll forward
+        # Roll forward: i+1 -> i, i+2 -> i+1
         idx_seq = idx_seq_next
         conv_state_batch_coord = conv_state_batch_coord_next
         conv_states_base = conv_states_base_next
@@ -3494,34 +3493,59 @@ def gluon_causal_conv1d_update_persistent_kernel_v7_opt1(
         col2 = col2_next
         x_vec = x_vec_next
         
-        idx_seq_next = idx_seq_next_next
-        conv_state_batch_coord_next = conv_state_batch_coord_next_next
+        idx_seq_next = idx_seq_next2
+        conv_state_batch_coord_next = conv_state_batch_coord_next2
+        conv_states_base_next = conv_states_base_next2
+        col0_next = col0_next2
+        col1_next = col1_next2
+        col2_next = col2_next2
+        x_vec_next = x_vec_next2
 
-    # Epilogue: Process the last task
-    acc0 = gl.zeros((BLOCK_N,), dtype=o_ptr.type.element_ty, layout=blocked)
-    acc0 += w_col0 * col0
-    acc0 += w_col1 * col1
-    acc1 = gl.zeros((BLOCK_N,), dtype=o_ptr.type.element_ty, layout=blocked)
-    acc1 += w_col2 * col2
-    acc1 += w_col3 * x_vec
-    acc = acc0 + acc1
+    # Epilogue: Process the last two tasks
+    # Process task n-2 (if exists)
+    if cu_num_tasks >= 2:
+        acc = gl.zeros((BLOCK_N,), dtype=o_ptr.type.element_ty, layout=blocked)
+        acc += w_col0 * col0
+        acc += w_col1 * col1
+        acc += w_col2 * col2
+        acc += w_col3 * x_vec
 
-    # SILU activation
+        acc_fp32 = acc.to(gl.float32)
+        acc = acc_fp32 / (1 + gl.exp(-acc_fp32))
+        acc = acc.to(x_vec.dtype)
+        
+        o_ptrs = o_ptr + idx_seq * stride_o_seq + idx_feats * stride_o_dim
+        gl.store(o_ptrs, acc, mask)
+        
+        gl.store(conv_states_base, col1, mask)
+        gl.store(conv_states_base + stride_conv_state_tok, col2, mask)
+        gl.store(conv_states_base + 2*stride_conv_state_tok, x_vec, mask)
+        
+        # Move to task n-1
+        idx_seq = idx_seq_next
+        conv_states_base = conv_states_base_next
+        col0 = col0_next
+        col1 = col1_next
+        col2 = col2_next
+        x_vec = x_vec_next
+    
+    # Process task n-1 (last task)
+    acc = gl.zeros((BLOCK_N,), dtype=o_ptr.type.element_ty, layout=blocked)
+    acc += w_col0 * col0
+    acc += w_col1 * col1
+    acc += w_col2 * col2
+    acc += w_col3 * x_vec
+
     acc_fp32 = acc.to(gl.float32)
     acc = acc_fp32 / (1 + gl.exp(-acc_fp32))
     acc = acc.to(x_vec.dtype)
     
-    # Store output
     o_ptrs = o_ptr + idx_seq * stride_o_seq + idx_feats * stride_o_dim
     gl.store(o_ptrs, acc, mask)
     
-    # Write back updated conv state
-    conv_states_ptrs = conv_states_base
-    gl.store(conv_states_ptrs, col1, mask)
-    conv_states_ptrs = conv_states_ptrs + stride_conv_state_tok
-    gl.store(conv_states_ptrs, col2, mask)
-    conv_states_ptrs = conv_states_ptrs + stride_conv_state_tok
-    gl.store(conv_states_ptrs, x_vec, mask)
+    gl.store(conv_states_base, col1, mask)
+    gl.store(conv_states_base + stride_conv_state_tok, col2, mask)
+    gl.store(conv_states_base + 2*stride_conv_state_tok, x_vec, mask)
 
 @gluon.jit()
 def gluon_causal_conv1d_update_persistent_kernel_v7_opt2(
@@ -3624,85 +3648,92 @@ def gluon_causal_conv1d_update_persistent_kernel_v7_opt2(
     w_ptrs = w_base + (3 * stride_w_width)  # [BLOCK_N] tensor
     w_col3 = gl.load(w_ptrs, mask, other=0.0)
     
-    # Prologue: Pre-load conv_state_batch_coord for first TWO iterations (2-level prefetch for batch coord only)
+    # Prologue: Pre-load data for first TWO tasks (2-level prefetch)
     idx_seq = cu_task_offset
     
-    # Load conv_state_batch_coord for task 0
+    # Early exit for empty tasks
+    if cu_num_tasks == 0:
+        return
+    
+    # Load task 0 conv_state_batch_coord
     conv_state_batch_coord_ptr = (conv_state_indices_ptr + idx_seq * stride_state_indices)
     conv_state_batch_coord = gl.load(conv_state_batch_coord_ptr).to(gl.int64)
     
-    # Pre-load conv_state_batch_coord for task 1 (2-level prefetch)
-    idx_seq_next = idx_seq + 1
-    conv_state_batch_coord_ptr_next = (conv_state_indices_ptr + idx_seq_next * stride_state_indices)
-    conv_state_batch_coord_next = gl.load(conv_state_batch_coord_ptr_next).to(gl.int64)
-    
-    # Load col0, col1, col2, x for task 0 (1-level prefetch)
+    # Initialize next task variables (will be overwritten if cu_num_tasks > 1)
+    idx_seq_next = idx_seq
+    conv_state_batch_coord_next = conv_state_batch_coord
     conv_states_base = (
         conv_state_ptr
         + (conv_state_batch_coord * stride_conv_state_seq)
         + (idx_feats * stride_conv_state_dim)
     )
-    conv_states_ptrs0 = conv_states_base
-    col0 = gl.load(conv_states_ptrs0, mask, 0.0)
-    conv_states_ptrs1 = conv_states_base + stride_conv_state_tok
-    col1 = gl.load(conv_states_ptrs1, mask, 0.0)
-    conv_states_ptrs2 = conv_states_base + 2*stride_conv_state_tok
-    col2 = gl.load(conv_states_ptrs2, mask, 0.0)
+    col0 = gl.zeros((BLOCK_N,), dtype=o_ptr.type.element_ty, layout=blocked)
+    col1 = col0
+    col2 = col0
+    x_vec = col0
+    # col0 = gl.load(conv_states_base, mask, 0.0)
+    # col1 = gl.load(conv_states_base + stride_conv_state_tok, mask, 0.0)
+    # col2 = gl.load(conv_states_base + 2*stride_conv_state_tok, mask, 0.0)
+    # x_ptrs_1d = x_ptr + (idx_seq * stride_x_seq) + (idx_feats * stride_x_dim)
+    # x_vec = gl.load(x_ptrs_1d, mask)
     
-    x_ptrs_1d = x_ptr + (idx_seq * stride_x_seq) + (idx_feats * stride_x_dim)
-    x_vec = gl.load(x_ptrs_1d, mask)
+    # Pre-load task 1 conv_state_batch_coord and data if available
+    if cu_num_tasks > 1:
+        # Load task 1 conv_state_batch_coord
+        idx_seq_next = idx_seq + 1
+        conv_state_batch_coord_ptr_next = (conv_state_indices_ptr + idx_seq_next * stride_state_indices)
+        conv_state_batch_coord_next = gl.load(conv_state_batch_coord_ptr_next).to(gl.int64)
+        # Load task 0 data
+        conv_states_base = (
+            conv_state_ptr
+            + (conv_state_batch_coord * stride_conv_state_seq)
+            + (idx_feats * stride_conv_state_dim)
+        )
+        col0 = gl.load(conv_states_base, mask, 0.0)
+        col1 = gl.load(conv_states_base + stride_conv_state_tok, mask, 0.0)
+        col2 = gl.load(conv_states_base + 2*stride_conv_state_tok, mask, 0.0)
+        x_ptrs_1d = x_ptr + (idx_seq * stride_x_seq) + (idx_feats * stride_x_dim)
+        x_vec = gl.load(x_ptrs_1d, mask)
 
-    # Main loop with 2-level prefetch for conv_state_batch_coord, 1-level for data
-    for task_idx in range(cu_num_tasks - 1):
-        # Pre-load conv_state_batch_coord for task i+2 (2 iterations ahead)
-        idx_seq_next_next = idx_seq + 2
-        conv_state_batch_coord_ptr_next_next = (conv_state_indices_ptr + idx_seq_next_next * stride_state_indices)
-        conv_state_batch_coord_next_next = gl.load(conv_state_batch_coord_ptr_next_next).to(gl.int64)
+    # Main loop with 2-level prefetch
+    for task_idx in range(cu_num_tasks - 2):
+        # Pre-load i+2 conv_state_batch_coord
+        idx_seq_next2 = idx_seq + 2
+        conv_state_batch_coord_ptr_next2 = (conv_state_indices_ptr + idx_seq_next2 * stride_state_indices)
+        conv_state_batch_coord_next2 = gl.load(conv_state_batch_coord_ptr_next2).to(gl.int64)
         
-        # Pre-load col0, col1, col2, x for task i+1 (1 iteration ahead) using already-loaded conv_state_batch_coord_next
+        # Load task i+1 data
         conv_states_base_next = (
             conv_state_ptr
             + (conv_state_batch_coord_next * stride_conv_state_seq)
             + (idx_feats * stride_conv_state_dim)
         )
-        
-        conv_states_ptrs_next0 = conv_states_base_next
-        col0_next = gl.load(conv_states_ptrs_next0, mask, 0.0)
-        conv_states_ptrs_next1 = conv_states_base_next + stride_conv_state_tok
-        col1_next = gl.load(conv_states_ptrs_next1, mask, 0.0)
-        conv_states_ptrs_next2 = conv_states_base_next + 2*stride_conv_state_tok
-        col2_next = gl.load(conv_states_ptrs_next2, mask, 0.0)
-
+        col0_next = gl.load(conv_states_base_next, mask, 0.0)
+        col1_next = gl.load(conv_states_base_next + stride_conv_state_tok, mask, 0.0)
+        col2_next = gl.load(conv_states_base_next + 2*stride_conv_state_tok, mask, 0.0)
         x_ptrs_1d_next = x_ptr + (idx_seq_next * stride_x_seq) + (idx_feats * stride_x_dim)
         x_vec_next = gl.load(x_ptrs_1d_next, mask)
         
-        # Compute current task
-        acc0 = gl.zeros((BLOCK_N,), dtype=o_ptr.type.element_ty, layout=blocked)
-        acc1 = acc0
-        acc2 = acc0
-        acc3 = acc0
-        acc0 += w_col0 * col0
-        acc1 += w_col1 * col1
-        acc2 += w_col2 * col2
-        acc3 += w_col3 * x_vec
-        acc = acc0 + acc1 + acc2 + acc3
-
+        # Compute task i
+        acc = gl.zeros((BLOCK_N,), dtype=o_ptr.type.element_ty, layout=blocked)
+        acc += w_col0 * col0
+        acc += w_col1 * col1
+        acc += w_col2 * col2
+        acc += w_col3 * x_vec
         # SILU activation
         acc_fp32 = acc.to(gl.float32)
         acc = acc_fp32 / (1 + gl.exp(-acc_fp32))
         acc = acc.to(x_vec.dtype)
 
+        # Store output for task i
         o_ptrs = o_ptr + idx_seq * stride_o_seq + idx_feats * stride_o_dim
         gl.store(o_ptrs, acc, mask)
+        # Write back updated conv state for task i
+        gl.store(conv_states_base, col1, mask)
+        gl.store(conv_states_base + stride_conv_state_tok, col2, mask)
+        gl.store(conv_states_base + 2*stride_conv_state_tok, x_vec, mask)
         
-        conv_states_ptrs0 = conv_states_base
-        gl.store(conv_states_ptrs0, col1, mask)
-        conv_states_ptrs1 = conv_states_base + stride_conv_state_tok
-        gl.store(conv_states_ptrs1, col2, mask)
-        conv_states_ptrs2 = conv_states_base + 2*stride_conv_state_tok
-        gl.store(conv_states_ptrs2, x_vec, mask)
-        
-        # Roll forward
+        # Roll forward: i+1 -> i, i+2 -> i+1
         idx_seq = idx_seq_next
         conv_state_batch_coord = conv_state_batch_coord_next
         conv_states_base = conv_states_base_next
@@ -3711,36 +3742,66 @@ def gluon_causal_conv1d_update_persistent_kernel_v7_opt2(
         col2 = col2_next
         x_vec = x_vec_next
         
-        idx_seq_next = idx_seq_next_next
-        conv_state_batch_coord_next = conv_state_batch_coord_next_next
+        idx_seq_next = idx_seq_next2
+        conv_state_batch_coord_next = conv_state_batch_coord_next2
 
-    # Epilogue: Process the last task
-    acc0 = gl.zeros((BLOCK_N,), dtype=o_ptr.type.element_ty, layout=blocked)
-    acc1 = acc0
-    acc2 = acc0
-    acc3 = acc0
-    acc0 += w_col0 * col0
-    acc1 += w_col1 * col1
-    acc2 += w_col2 * col2
-    acc3 += w_col3 * x_vec
-    acc = acc0 + acc1 + acc2 + acc3
+    # Epilogue: Process the last two tasks
+    # Process task n-2 (if exists)
+    if cu_num_tasks >= 2:
+        # Load task i+1 data
+        conv_states_base_next = (
+            conv_state_ptr
+            + (conv_state_batch_coord_next * stride_conv_state_seq)
+            + (idx_feats * stride_conv_state_dim)
+        )
+        col0_next = gl.load(conv_states_base_next, mask, 0.0)
+        col1_next = gl.load(conv_states_base_next + stride_conv_state_tok, mask, 0.0)
+        col2_next = gl.load(conv_states_base_next + 2*stride_conv_state_tok, mask, 0.0)
+        x_ptrs_1d_next = x_ptr + (idx_seq_next * stride_x_seq) + (idx_feats * stride_x_dim)
+        x_vec_next = gl.load(x_ptrs_1d_next, mask)
+        
+        # Compute task i
+        acc = gl.zeros((BLOCK_N,), dtype=o_ptr.type.element_ty, layout=blocked)
+        acc += w_col0 * col0
+        acc += w_col1 * col1
+        acc += w_col2 * col2
+        acc += w_col3 * x_vec
 
-    # SILU activation
+        acc_fp32 = acc.to(gl.float32)
+        acc = acc_fp32 / (1 + gl.exp(-acc_fp32))
+        acc = acc.to(x_vec.dtype)
+        
+        # Store output for task i
+        o_ptrs = o_ptr + idx_seq * stride_o_seq + idx_feats * stride_o_dim
+        gl.store(o_ptrs, acc, mask)
+        gl.store(conv_states_base, col1, mask)
+        gl.store(conv_states_base + stride_conv_state_tok, col2, mask)
+        gl.store(conv_states_base + 2*stride_conv_state_tok, x_vec, mask)
+        
+        # Move to task n-1
+        idx_seq = idx_seq_next
+        conv_states_base = conv_states_base_next
+        col0 = col0_next
+        col1 = col1_next
+        col2 = col2_next
+        x_vec = x_vec_next
+    
+    # Compute and Store task n-1 (last task)
+    acc = gl.zeros((BLOCK_N,), dtype=o_ptr.type.element_ty, layout=blocked)
+    acc += w_col0 * col0
+    acc += w_col1 * col1
+    acc += w_col2 * col2
+    acc += w_col3 * x_vec
+
     acc_fp32 = acc.to(gl.float32)
     acc = acc_fp32 / (1 + gl.exp(-acc_fp32))
     acc = acc.to(x_vec.dtype)
     
-    # Store output
     o_ptrs = o_ptr + idx_seq * stride_o_seq + idx_feats * stride_o_dim
     gl.store(o_ptrs, acc, mask)
-    
-    # Write back updated conv state
-    conv_states_ptrs = conv_states_base
-    gl.store(conv_states_ptrs, col1, mask)
-    conv_states_ptrs = conv_states_ptrs + stride_conv_state_tok
-    gl.store(conv_states_ptrs, col2, mask)
-    conv_states_ptrs = conv_states_ptrs + stride_conv_state_tok
-    gl.store(conv_states_ptrs, x_vec, mask)
+    gl.store(conv_states_base, col1, mask)
+    gl.store(conv_states_base + stride_conv_state_tok, col2, mask)
+    gl.store(conv_states_base + 2*stride_conv_state_tok, x_vec, mask)
 
 @gluon.jit()
 def gluon_causal_conv1d_update_persistent_kernel_v8(
