@@ -15,6 +15,8 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_update_persistent,
     causal_conv1d_update_persistent_v2,
     causal_conv1d_update_persistent_v1,
+    causal_conv1d_update_persistent_v4,
+    causal_conv1d_update_persistent_v3,
     causal_conv1d_update_v2,
 )
 
@@ -269,12 +271,13 @@ def test_causal_conv1d_update(batch, dim, width, seqlen, has_bias, silu_activati
     print(f"{'='*70}")
     
     persistent_kernel_works = False
+    causal_conv1d_update_persistent_fn = causal_conv1d_update_persistent_v4
     
     # Test with conv_state_indices
     try:
         conv_state_persistent_idx = conv_state_large.detach().clone()
         
-        out_persistent_idx = causal_conv1d_update_persistent_v1(
+        out_persistent_idx = causal_conv1d_update_persistent_fn(
             x.clone(), conv_state_persistent_idx, weight, bias, 
             activation=activation, conv_state_indices=conv_state_indices
         )
@@ -330,7 +333,7 @@ def test_causal_conv1d_update(batch, dim, width, seqlen, has_bias, silu_activati
     if persistent_kernel_works:
         try:
             for _ in range(num_warmup):
-                _ = causal_conv1d_update_persistent_v1(
+                _ = causal_conv1d_update_persistent_fn(
                     x.clone(), conv_state_persistent_idx.clone(), weight, bias, 
                     activation=activation, conv_state_indices=conv_state_indices
                 )
@@ -338,7 +341,7 @@ def test_causal_conv1d_update(batch, dim, width, seqlen, has_bias, silu_activati
             
             start_time = time.time()
             for _ in range(num_iters):
-                _ = causal_conv1d_update_persistent_v1(
+                _ = causal_conv1d_update_persistent_fn(
                     x.clone(), conv_state_persistent_idx.clone(), weight, bias, 
                     activation=activation, conv_state_indices=conv_state_indices
                 )
