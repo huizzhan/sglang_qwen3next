@@ -18,6 +18,7 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_update_persistent_v4,
     causal_conv1d_update_persistent_v3,
     causal_conv1d_update_v2,
+    causal_conv1d_update_v1,
 )
 
 from sglang.srt.layers.attention.mamba.causal_conv1d_split_qkv import (
@@ -192,6 +193,12 @@ def causal_conv1d_opcheck_fn(
 @pytest.mark.parametrize("total_entries", [128])
 
 def test_causal_conv1d_update(batch, dim, width, seqlen, has_bias, silu_activation, itype, total_entries):
+    # causal_conv1d_update_fn = causal_conv1d_update
+    # causal_conv1d_update_persistent_fn = causal_conv1d_update_v1
+    
+    causal_conv1d_update_fn = causal_conv1d_update_v1
+    causal_conv1d_update_persistent_fn = causal_conv1d_update
+    
     """
     Test causal_conv1d_update with conv_state_indices (continuous batching mode only).
     
@@ -243,7 +250,7 @@ def test_causal_conv1d_update(batch, dim, width, seqlen, has_bias, silu_activati
     )
     
     # Run Gluon kernel with conv_state_indices
-    out_gluon_indices = causal_conv1d_update(
+    out_gluon_indices = causal_conv1d_update_fn(
         x.clone(), conv_state_large_gluon, weight, bias, 
         activation=activation, conv_state_indices=conv_state_indices
     )
@@ -271,7 +278,7 @@ def test_causal_conv1d_update(batch, dim, width, seqlen, has_bias, silu_activati
     print(f"{'='*70}")
     
     persistent_kernel_works = False
-    causal_conv1d_update_persistent_fn = causal_conv1d_update_persistent_v4
+    # causal_conv1d_update_persistent_fn = causal_conv1d_update_persistent_v4
     
     # Test with conv_state_indices
     try:
@@ -313,7 +320,7 @@ def test_causal_conv1d_update(batch, dim, width, seqlen, has_bias, silu_activati
     
     # Test 1: Gluon with conv_state_indices
     for _ in range(num_warmup):
-        _ = causal_conv1d_update(
+        _ = causal_conv1d_update_fn(
             x.clone(), conv_state_large_gluon.clone(), weight, bias, 
             activation=activation, conv_state_indices=conv_state_indices
         )
@@ -321,7 +328,7 @@ def test_causal_conv1d_update(batch, dim, width, seqlen, has_bias, silu_activati
     
     start_time = time.time()
     for _ in range(num_iters):
-        _ = causal_conv1d_update(
+        _ = causal_conv1d_update_fn(
             x.clone(), conv_state_large_gluon.clone(), weight, bias, 
             activation=activation, conv_state_indices=conv_state_indices
         )
