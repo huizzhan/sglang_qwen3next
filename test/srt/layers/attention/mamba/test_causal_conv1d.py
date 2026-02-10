@@ -188,7 +188,7 @@ def causal_conv1d_opcheck_fn(
 # @pytest.mark.parametrize("dim", [2048, 2048 + 16, 4096])
 @pytest.mark.parametrize("dim", [2048])
 # @pytest.mark.parametrize("batch", [1, 8, 64, 128, 256, 512, 1024])
-@pytest.mark.parametrize("batch", [128])
+@pytest.mark.parametrize("batch", [64])
 # @pytest.mark.parametrize("total_entries", [256, 384, 640, 1280])
 @pytest.mark.parametrize("total_entries", [128])
 

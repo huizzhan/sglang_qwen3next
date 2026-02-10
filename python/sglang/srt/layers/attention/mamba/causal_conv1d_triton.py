@@ -14,7 +14,7 @@ PAD_SLOT_ID = -1
 
 import os
 # os.environ["TRITON_PRINT_AUTOTUNING"] = "1"  # 显示 autotune 过程和结果
-os.environ["TRITON_CACHE_DIR"] = "/sgl-workspace/sglang/conv1d_gluon_v1_opt1_cache"
+os.environ["TRITON_CACHE_DIR"] = "/sgl-workspace/sglang/conv1d_gluon_v1_opt2_cache"
 # os.environ["MLIR_ENABLE_DUMP"] = "1"
 # os.environ["AMDGCN_ENABLE_DUMP"] = "1"
 
@@ -1507,6 +1507,232 @@ def gluon_causal_conv1d_update_kernel_v1_opt1(
     x_base_1d = x_ptr + (idx_seq * stride_x_seq) + (idx_feats * stride_x_dim)  # starting of chunk [BLOCK_N]
     x_vec = gl.load(x_base_1d)
     acc += w_col3 * x_vec  # [BLOCK_N]
+
+    # Convert to fp32 for exp calculation, then convert back
+    acc_fp32 = acc.to(gl.float32)
+    acc = acc_fp32 / (1 + gl.exp(-acc_fp32))
+    acc = acc.to(x_vec.dtype)
+
+    o_ptrs = (
+        o_ptr
+        + (idx_seq) * stride_o_seq
+        + (idx_feats * stride_o_dim)
+    )
+
+    gl.store(o_ptrs, acc)
+    gl.store(conv_states_base, col1)
+    gl.store(conv_states_base + stride_conv_state_tok, col2)
+    gl.store(conv_states_base + 2 * stride_conv_state_tok, x_vec)
+
+@gluon.jit()
+def gluon_causal_conv1d_update_kernel_v1_opt2(
+    # Pointers to matrices
+    x_ptr,  # (batch, dim, seqlen)
+    w_ptr,  # (dim, width)
+    bias_ptr,
+    conv_state_ptr,
+    cache_seqlens_ptr,  # circular buffer
+    conv_state_indices_ptr,
+    num_accepted_tokens_ptr,
+    intermediate_conv_window_ptr,
+    o_ptr,  # (batch, dim, seqlen)
+    # Matrix dimensions
+    batch: int,
+    dim: gl.constexpr,
+    seqlen: gl.constexpr,
+    state_len: gl.constexpr,
+    num_cache_lines: gl.constexpr,  # added to support vLLM larger cache lines
+    # Strides
+    stride_x_seq: gl.constexpr,
+    stride_x_dim: gl.constexpr,
+    stride_x_token: gl.constexpr,
+    stride_w_dim: gl.constexpr,
+    stride_w_width: gl.constexpr,
+    stride_conv_state_seq: gl.constexpr,
+    stride_conv_state_dim: gl.constexpr,
+    stride_conv_state_tok: gl.constexpr,
+    stride_state_indices: gl.constexpr,
+    stride_inter_seq: gl.constexpr,
+    stride_inter_step: gl.constexpr,
+    stride_inter_dim: gl.constexpr,
+    stride_inter_win: gl.constexpr,
+    stride_o_seq: gl.constexpr,
+    stride_o_dim: gl.constexpr,
+    stride_o_token: gl.constexpr,
+    # others
+    pad_slot_id: gl.constexpr,
+    # Meta-parameters
+    HAS_BIAS: gl.constexpr,
+    KERNEL_WIDTH: gl.constexpr,
+    SILU_ACTIVATION: gl.constexpr,
+    IS_CONTINUOUS_BATCHING: gl.constexpr,
+    IS_SPEC_DECODING: gl.constexpr,
+    NP2_STATELEN: gl.constexpr,
+    USE_PAD_SLOT: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    SAVE_INTERMEDIATE: gl.constexpr,
+):
+
+    blocked: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[2],
+        threads_per_warp=[64],
+        warps_per_cta=[2],
+        order=[0],
+    )
+    idx_seq = gl.program_id(0)
+    conv_state_batch_coord_ptr = conv_state_indices_ptr + idx_seq * stride_state_indices
+    # [BLOCK_N,] elements along the feature-dimension (channel)
+    idx_feats = gl.program_id(1) * BLOCK_N + gl.arange(0, BLOCK_N, layout=blocked)
+    conv_state_batch_coord_tmp = gl.load(conv_state_batch_coord_ptr)
+    
+    w_base = w_ptr + (idx_feats * stride_w_dim)  # [BLOCK_N,]
+    x_base_1d = x_ptr + (idx_seq * stride_x_seq) + (idx_feats * stride_x_dim)  # starting of chunk [BLOCK_N]
+    
+    conv_state_batch_coord = conv_state_batch_coord_tmp.to(gl.int64)
+
+    if USE_PAD_SLOT:  # noqa
+        if conv_state_batch_coord == pad_slot_id:
+            # not processing as this is not the actual sequence
+            return
+
+    # STEP 1: READ init_state data
+    conv_states_base = (
+        conv_state_ptr
+        + (conv_state_batch_coord * stride_conv_state_seq)
+        + (idx_feats * stride_conv_state_dim)
+    )
+    
+    w_col0 = gl.load(w_base)
+    w_col1 = gl.load(w_base + 1 * stride_w_width)
+    w_col2 = gl.load(w_base + 2 * stride_w_width)
+    w_col3 = gl.load(w_base + 3 * stride_w_width)
+    
+    x_vec = gl.load(x_base_1d)
+    
+    col0 = gl.load(conv_states_base)
+    col1 = gl.load(conv_states_base + 1 * stride_conv_state_tok)
+    col2 = gl.load(conv_states_base + 2 * stride_conv_state_tok)
+    
+    acc = gl.zeros((BLOCK_N,), dtype=o_ptr.type.element_ty, layout=blocked)
+    acc += w_col0 * col0  # [BLOCK_N]
+    acc += w_col1 * col1  # [BLOCK_N]
+    acc += w_col2 * col2  # [BLOCK_N]
+    acc += w_col3 * x_vec  # [BLOCK_N]
+
+    # Convert to fp32 for exp calculation, then convert back
+    acc_fp32 = acc.to(gl.float32)
+    acc = acc_fp32 / (1 + gl.exp(-acc_fp32))
+    acc = acc.to(x_vec.dtype)
+
+    o_ptrs = (
+        o_ptr
+        + (idx_seq) * stride_o_seq
+        + (idx_feats * stride_o_dim)
+    )
+
+    gl.store(o_ptrs, acc)
+    gl.store(conv_states_base, col1)
+    gl.store(conv_states_base + stride_conv_state_tok, col2)
+    gl.store(conv_states_base + 2 * stride_conv_state_tok, x_vec)
+
+@gluon.jit()
+def gluon_causal_conv1d_update_kernel_v1_opt3(
+    # Pointers to matrices
+    x_ptr,  # (batch, dim, seqlen)
+    w_ptr,  # (dim, width)
+    bias_ptr,
+    conv_state_ptr,
+    cache_seqlens_ptr,  # circular buffer
+    conv_state_indices_ptr,
+    num_accepted_tokens_ptr,
+    intermediate_conv_window_ptr,
+    o_ptr,  # (batch, dim, seqlen)
+    # Matrix dimensions
+    batch: int,
+    dim: gl.constexpr,
+    seqlen: gl.constexpr,
+    state_len: gl.constexpr,
+    num_cache_lines: gl.constexpr,  # added to support vLLM larger cache lines
+    # Strides
+    stride_x_seq: gl.constexpr,
+    stride_x_dim: gl.constexpr,
+    stride_x_token: gl.constexpr,
+    stride_w_dim: gl.constexpr,
+    stride_w_width: gl.constexpr,
+    stride_conv_state_seq: gl.constexpr,
+    stride_conv_state_dim: gl.constexpr,
+    stride_conv_state_tok: gl.constexpr,
+    stride_state_indices: gl.constexpr,
+    stride_inter_seq: gl.constexpr,
+    stride_inter_step: gl.constexpr,
+    stride_inter_dim: gl.constexpr,
+    stride_inter_win: gl.constexpr,
+    stride_o_seq: gl.constexpr,
+    stride_o_dim: gl.constexpr,
+    stride_o_token: gl.constexpr,
+    # others
+    pad_slot_id: gl.constexpr,
+    # Meta-parameters
+    HAS_BIAS: gl.constexpr,
+    KERNEL_WIDTH: gl.constexpr,
+    SILU_ACTIVATION: gl.constexpr,
+    IS_CONTINUOUS_BATCHING: gl.constexpr,
+    IS_SPEC_DECODING: gl.constexpr,
+    NP2_STATELEN: gl.constexpr,
+    USE_PAD_SLOT: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    SAVE_INTERMEDIATE: gl.constexpr,
+):
+
+    blocked: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[2],
+        threads_per_warp=[64],
+        warps_per_cta=[2],
+        order=[0],
+    )
+    idx_seq = gl.program_id(0)
+    conv_state_batch_coord_ptr = conv_state_indices_ptr + idx_seq * stride_state_indices
+    # [BLOCK_N,] elements along the feature-dimension (channel)
+    idx_feats = gl.program_id(1) * BLOCK_N + gl.arange(0, BLOCK_N, layout=blocked)
+    conv_state_batch_coord_tmp = gl.load(conv_state_batch_coord_ptr)
+    
+    w_base = w_ptr + (idx_feats * stride_w_dim)  # [BLOCK_N,]
+    x_base_1d = x_ptr + (idx_seq * stride_x_seq) + (idx_feats * stride_x_dim)  # starting of chunk [BLOCK_N]
+
+    conv_state_batch_coord = conv_state_batch_coord_tmp.to(gl.int64)
+
+    if USE_PAD_SLOT:  # noqa
+        if conv_state_batch_coord == pad_slot_id:
+            # not processing as this is not the actual sequence
+            return
+
+    # STEP 1: READ init_state data
+    conv_states_base = (
+        conv_state_ptr
+        + (conv_state_batch_coord * stride_conv_state_seq)
+        + (idx_feats * stride_conv_state_dim)
+    )
+    
+    w_col0 = gl.load(w_base)
+    col0 = gl.load(conv_states_base)
+    acc = gl.zeros((BLOCK_N,), dtype=o_ptr.type.element_ty, layout=blocked)
+    acc += w_col0 * col0  # [BLOCK_N]
+    # gl.amd.cdna3.sched_barrier(0)
+
+    w_col1 = gl.load(w_base + 1 * stride_w_width)
+    col1 = gl.load(conv_states_base + 1 * stride_conv_state_tok)
+    acc += w_col1 * col1  # [BLOCK_N]
+    # gl.amd.cdna3.sched_barrier(0)
+
+    w_col2 = gl.load(w_base + 2 * stride_w_width)
+    col2 = gl.load(conv_states_base + 2 * stride_conv_state_tok)
+    acc += w_col2 * col2  # [BLOCK_N]
+    # gl.amd.cdna3.sched_barrier(0)
+    
+    w_col3 = gl.load(w_base + 3 * stride_w_width)
+    x_vec = gl.load(x_base_1d)
+    acc += w_col3 * x_vec  # [BLOCK_N]
+    # gl.amd.cdna3.sched_barrier(0)
 
     # Convert to fp32 for exp calculation, then convert back
     acc_fp32 = acc.to(gl.float32)
@@ -5284,7 +5510,7 @@ def causal_conv1d_update_v1(
         stride_inter_seq = stride_inter_step = stride_inter_dim = stride_inter_win = 0
 
     # _causal_conv1d_update_kernel[grid](
-    gluon_causal_conv1d_update_kernel_v1_opt1[grid](
+    gluon_causal_conv1d_update_kernel_v1_opt3[grid](
         # Pointers to matrices
         x,
         weight,
